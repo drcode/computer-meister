@@ -13,17 +13,17 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from openai import OpenAI
 from playwright.async_api import async_playwright
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-DISPLAY_WIDTH = 1024
-DISPLAY_HEIGHT = 768
-MAX_ACTIONS = 10
-TIMEOUT_SECONDS = 120
+DISPLAY_WIDTH = 2048
+DISPLAY_HEIGHT = 1600
+MAX_ACTIONS = 40
+TIMEOUT_SECONDS = 400
 PROFILE_BASE_DIR = Path.home() / ".computer-meister-profile"
 ARTIFACTS_DIR = Path("artifacts")
 CUA_MODEL = "computer-use-preview"
@@ -31,6 +31,16 @@ LOGIN_CHECK_MODEL = "gpt-4o-mini"
 
 DEFAULT_URL = "https://weather.com"
 DEFAULT_QUESTION = "What is the current temperature for ZIP code 94941?"
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/132.0.0.0 Safari/537.36"
+)
+CHROMIUM_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-http2",
+    "--disable-quic",
+]
 
 
 # ── API key loading (mirrors ~/monorepo/common/ai.py) ───────────────────────
@@ -78,6 +88,75 @@ def ensure_url(url: str) -> str:
     return url
 
 
+def add_www_subdomain(url: str) -> str:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not host or host.startswith("www."):
+        return url
+    netloc = parsed.netloc
+    if parsed.port:
+        netloc = f"www.{host}:{parsed.port}"
+    else:
+        netloc = f"www.{host}"
+    return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
+
+
+def navigation_candidates(url: str) -> list[str]:
+    base = ensure_url(url)
+    parsed = urlparse(base)
+    scheme = parsed.scheme or "https"
+    host = parsed.hostname or ""
+    path = parsed.path or "/"
+    query = parsed.query
+    fragment = parsed.fragment
+    port = f":{parsed.port}" if parsed.port else ""
+
+    hosts: list[str] = []
+    if host:
+        hosts.append(host)
+        if not host.startswith("www."):
+            hosts.append(f"www.{host}")
+
+    schemes = [scheme]
+
+    candidates: list[str] = []
+    for candidate_scheme in schemes:
+        for candidate_host in hosts:
+            candidate = urlunparse(
+                (candidate_scheme, f"{candidate_host}{port}", path, parsed.params, query, fragment)
+            )
+            if candidate not in candidates:
+                candidates.append(candidate)
+    return candidates
+
+
+async def goto_with_fallback(page, url: str, *, wait_until: str = "domcontentloaded", timeout: int = 30000):
+    last_error: Exception | None = None
+    candidates = navigation_candidates(url)
+    for idx, candidate in enumerate(candidates):
+        try:
+            if idx == 0:
+                return await page.goto(candidate, wait_until=wait_until, timeout=timeout)
+            log(f"retrying navigation with {candidate}")
+            return await page.goto(candidate, wait_until=wait_until, timeout=timeout)
+        except Exception as e:
+            last_error = e
+            log(f"goto failed for {candidate}: {e}")
+
+    if wait_until != "commit":
+        for candidate in candidates:
+            try:
+                log(f"retrying navigation with relaxed wait: {candidate}")
+                return await page.goto(candidate, wait_until="commit", timeout=timeout)
+            except Exception as e:
+                last_error = e
+                log(f"goto failed (relaxed) for {candidate}: {e}")
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Navigation failed with no candidates for URL: {url}")
+
+
 def get_profile_key(url: str) -> str:
     host = (urlparse(url).hostname or "").lower()
     if not host:
@@ -109,6 +188,19 @@ async def take_screenshot(page, step: int | str = "") -> tuple[str, bytes]:
 
 def log(msg: str) -> None:
     print(f"  {msg}", flush=True)
+
+
+def launch_context_kwargs(*, headless: bool, use_chrome_channel: bool = False) -> dict:
+    kwargs = {
+        "headless": headless,
+        "user_agent": DEFAULT_USER_AGENT,
+        "args": CHROMIUM_ARGS,
+        "viewport": {"width": DISPLAY_WIDTH, "height": DISPLAY_HEIGHT},
+        "device_scale_factor": 1,
+    }
+    if use_chrome_channel:
+        kwargs["channel"] = "chrome"
+    return kwargs
 
 
 # ── Action execution ────────────────────────────────────────────────────────
@@ -160,7 +252,7 @@ async def execute_action(page, action: dict) -> None:
         log("screenshot (requested by model)")
 
     elif action_type == "wait":
-        ms = action.get("ms", 1000)
+        ms = action.get("ms", 500)
         log(f"wait {ms}ms")
         await asyncio.sleep(ms / 1000)
 
@@ -209,24 +301,91 @@ def check_logged_in(client: OpenAI, screenshot_b64: str, url: str) -> bool:
 async def human_login_flow(playwright, client: OpenAI, url: str, profile_dir: Path, storage_state_path: Path) -> None:
     """Check if logged in; if not, open a visible browser for manual login."""
     log("Checking login status...")
+
+    async def _restore_cookies(context):
+        if storage_state_path.exists():
+            try:
+                state = json.loads(storage_state_path.read_text())
+                cookies = state.get("cookies", [])
+                if cookies:
+                    await context.add_cookies(cookies)
+            except Exception:
+                pass
+
+    async def _try_login_check_navigation(context, page_obj):
+        """Try navigating for login check, escalating through headed/chrome fallbacks."""
+        try:
+            await goto_with_fallback(page_obj, url, wait_until="commit", timeout=15000)
+            return context, page_obj
+        except Exception as e:
+            log(f"Headless login check failed: {e}")
+
+        # Try headed mode with bundled Chromium
+        await context.close()
+        log("Retrying login check in headed mode.")
+        context = await playwright.chromium.launch_persistent_context(
+            str(profile_dir),
+            **launch_context_kwargs(headless=False),
+        )
+        page_obj = context.pages[0] if context.pages else await context.new_page()
+        await _restore_cookies(context)
+        try:
+            await goto_with_fallback(page_obj, url, wait_until="commit", timeout=20000)
+            return context, page_obj
+        except Exception as e:
+            log(f"Headed login check failed: {e}")
+
+        # Try headed mode with system Chrome
+        await context.close()
+        log("Retrying login check with channel='chrome'.")
+        context = await playwright.chromium.launch_persistent_context(
+            str(profile_dir),
+            **launch_context_kwargs(headless=False, use_chrome_channel=True),
+        )
+        page_obj = context.pages[0] if context.pages else await context.new_page()
+        await _restore_cookies(context)
+        try:
+            await goto_with_fallback(page_obj, url, wait_until="commit", timeout=20000)
+            return context, page_obj
+        except Exception as e:
+            log(f"Chrome channel login check failed: {e}")
+            raise
+
     ctx = await playwright.chromium.launch_persistent_context(
         str(profile_dir),
-        headless=True,
-        viewport={"width": DISPLAY_WIDTH, "height": DISPLAY_HEIGHT},
+        **launch_context_kwargs(headless=True),
     )
     page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+    await _restore_cookies(ctx)
 
-    # Restore saved cookies if available
-    if storage_state_path.exists():
+    try:
+        ctx, page = await _try_login_check_navigation(ctx, page)
+    except Exception as e:
+        log(f"All login check navigation attempts failed: {e}")
         try:
-            state = json.loads(storage_state_path.read_text())
-            cookies = state.get("cookies", [])
-            if cookies:
-                await ctx.add_cookies(cookies)
+            await ctx.close()
         except Exception:
             pass
 
-    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        log("Opening browser for manual login...")
+        print("\n>>> Please log in in the browser, then come back here and press ENTER to continue. <<<\n")
+        ctx = await playwright.chromium.launch_persistent_context(
+            str(profile_dir),
+            **launch_context_kwargs(headless=False, use_chrome_channel=True),
+        )
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        await _restore_cookies(ctx)
+        try:
+            await goto_with_fallback(page, url, wait_until="commit", timeout=30000)
+        except Exception as e2:
+            log(f"Manual login auto-navigation failed: {e2}")
+            print(f">>> Please manually navigate to {url} in the opened browser before pressing ENTER. <<<\n")
+
+        await asyncio.get_event_loop().run_in_executor(None, input)
+        await ctx.storage_state(path=str(storage_state_path))
+        await ctx.close()
+        log("Browser closed. Session saved.")
+        return
     await asyncio.sleep(2)
     screenshot_b64, _ = await take_screenshot(page, "login_check")
     logged_in = check_logged_in(client, screenshot_b64, url)
@@ -240,11 +399,14 @@ async def human_login_flow(playwright, client: OpenAI, url: str, profile_dir: Pa
     print("\n>>> Please log in in the browser, then come back here and press ENTER to continue. <<<\n")
     ctx = await playwright.chromium.launch_persistent_context(
         str(profile_dir),
-        headless=False,
-        viewport={"width": DISPLAY_WIDTH, "height": DISPLAY_HEIGHT},
+        **launch_context_kwargs(headless=False, use_chrome_channel=True),
     )
     page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    try:
+        await goto_with_fallback(page, url, wait_until="commit", timeout=30000)
+    except Exception as e:
+        log(f"Manual login auto-navigation failed: {e}")
+        print(f">>> Please manually navigate to {url} in the opened browser before pressing ENTER. <<<\n")
 
     # Wait for user to finish logging in — pressing Enter ensures we close cleanly
     await asyncio.get_event_loop().run_in_executor(None, input)
@@ -257,29 +419,64 @@ async def human_login_flow(playwright, client: OpenAI, url: str, profile_dir: Pa
 
 # ── CUA loop ────────────────────────────────────────────────────────────────
 
-async def cua_loop(playwright, client: OpenAI, url: str, question: str, profile_dir: Path, storage_state_path: Path) -> str:
+async def cua_loop(
+    playwright,
+    client: OpenAI,
+    url: str,
+    question: str,
+    profile_dir: Path,
+    storage_state_path: Path,
+    clicks_only: bool = False,
+) -> str:
     """Run the Computer Use Agent loop and return the final answer."""
-    ctx = await playwright.chromium.launch_persistent_context(
-        str(profile_dir),
-        headless=True,
-        viewport={"width": DISPLAY_WIDTH, "height": DISPLAY_HEIGHT},
-    )
-    page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-
-    # Restore saved cookies/localStorage if available
-    if storage_state_path.exists():
+    async def restore_storage_state(context) -> None:
+        if not storage_state_path.exists():
+            return
         try:
             state = json.loads(storage_state_path.read_text())
             cookies = state.get("cookies", [])
             if cookies:
-                await ctx.add_cookies(cookies)
+                await context.add_cookies(cookies)
                 log(f"Restored {len(cookies)} saved cookies.")
         except Exception as e:
             log(f"Warning: could not restore saved state: {e}")
 
+    ctx = await playwright.chromium.launch_persistent_context(
+        str(profile_dir),
+        **launch_context_kwargs(headless=True),
+    )
+    page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+
+    # Restore saved cookies/localStorage if available
+    await restore_storage_state(ctx)
+
     try:
         print(f"\nNavigating to {url} ...")
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        try:
+            await goto_with_fallback(page, url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as nav_error:
+            log(f"Headless navigation failed: {nav_error}")
+            log("Retrying navigation in headed mode.")
+            await ctx.close()
+            ctx = await playwright.chromium.launch_persistent_context(
+                str(profile_dir),
+                **launch_context_kwargs(headless=False),
+            )
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            await restore_storage_state(ctx)
+            try:
+                await goto_with_fallback(page, url, wait_until="domcontentloaded", timeout=45000)
+            except Exception as headed_nav_error:
+                log(f"Headed bundled Chromium failed: {headed_nav_error}")
+                log("Retrying with channel='chrome'.")
+                await ctx.close()
+                ctx = await playwright.chromium.launch_persistent_context(
+                    str(profile_dir),
+                    **launch_context_kwargs(headless=False, use_chrome_channel=True),
+                )
+                page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+                await restore_storage_state(ctx)
+                await goto_with_fallback(page, url, wait_until="domcontentloaded", timeout=45000)
         await asyncio.sleep(2)
 
         screenshot_b64, _ = await take_screenshot(page, "initial")
@@ -346,7 +543,10 @@ async def cua_loop(playwright, client: OpenAI, url: str, question: str, profile_
             call_id = computer_call.call_id
 
             print(f"\n[Action {action_count}/{MAX_ACTIONS}] ", end="")
-            await execute_action(page, action_dict)
+            if clicks_only and action_dict.get("type") != "click":
+                log(f"filtered non-click action: {action_dict.get('type')}")
+            else:
+                await execute_action(page, action_dict)
 
             # Brief pause for page to settle
             await asyncio.sleep(0.5)
@@ -391,6 +591,70 @@ async def cua_loop(playwright, client: OpenAI, url: str, question: str, profile_
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+async def run_browser_query_async(
+    url: str,
+    question: str,
+    *,
+    human_login: bool = False,
+    clicks_only: bool = False,
+) -> str:
+    url = ensure_url(url)
+    api_key = load_openai_api_key()
+    client = OpenAI(api_key=api_key)
+
+    profile_dir, storage_state_path = get_profile_paths(url)
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    run_meta = {
+        "url": url,
+        "question": question,
+        "human_login": human_login,
+        "clicks_only": clicks_only,
+        "started_at": datetime.now().isoformat(),
+        "actions": [],
+    }
+
+    async with async_playwright() as pw:
+        if human_login:
+            await human_login_flow(pw, client, url, profile_dir, storage_state_path)
+
+        answer = await cua_loop(
+            pw,
+            client,
+            url,
+            question,
+            profile_dir,
+            storage_state_path,
+            clicks_only=clicks_only,
+        )
+
+    run_meta["finished_at"] = datetime.now().isoformat()
+    run_meta["answer"] = answer
+
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    meta_path = ARTIFACTS_DIR / f"run_{ts}.json"
+    meta_path.write_text(json.dumps(run_meta, indent=2))
+    return answer
+
+
+def run_browser_query(
+    url: str,
+    question: str,
+    *,
+    human_login: bool = False,
+    clicks_only: bool = False,
+) -> str:
+    return asyncio.run(
+        run_browser_query_async(
+            url=url,
+            question=question,
+            human_login=human_login,
+            clicks_only=clicks_only,
+        )
+    )
+
+
 async def async_main() -> None:
     parser = argparse.ArgumentParser(
         description="Computer Meister — browse the web with AI to answer questions."
@@ -402,45 +666,31 @@ async def async_main() -> None:
         action="store_true",
         help="Check login status and allow manual login if needed",
     )
+    parser.add_argument(
+        "--clicks-only",
+        action="store_true",
+        help="Filter out all non-click model actions",
+    )
     args = parser.parse_args()
 
     url = ensure_url(args.url)
     question = args.question
     human_login = args.human_login
+    clicks_only = args.clicks_only
 
     print(f"URL:      {url}")
     print(f"Question: {question}")
     if human_login:
         print("Mode:     human-login enabled")
+    if clicks_only:
+        print("Mode:     clicks-only enabled")
 
-    api_key = load_openai_api_key()
-    client = OpenAI(api_key=api_key)
-
-    profile_dir, storage_state_path = get_profile_paths(url)
-    profile_dir.mkdir(parents=True, exist_ok=True)
-
-    run_meta = {
-        "url": url,
-        "question": question,
-        "human_login": human_login,
-        "started_at": datetime.now().isoformat(),
-        "actions": [],
-    }
-
-    async with async_playwright() as pw:
-        if human_login:
-            await human_login_flow(pw, client, url, profile_dir, storage_state_path)
-
-        answer = await cua_loop(pw, client, url, question, profile_dir, storage_state_path)
-
-    run_meta["finished_at"] = datetime.now().isoformat()
-    run_meta["answer"] = answer
-
-    # Save run metadata
-    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    meta_path = ARTIFACTS_DIR / f"run_{ts}.json"
-    meta_path.write_text(json.dumps(run_meta, indent=2))
+    answer = await run_browser_query_async(
+        url=url,
+        question=question,
+        human_login=human_login,
+        clicks_only=clicks_only,
+    )
 
     print(f"\n{'=' * 60}")
     print("ANSWER:")
