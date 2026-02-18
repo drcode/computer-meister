@@ -20,8 +20,8 @@ from playwright.async_api import async_playwright
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-DISPLAY_WIDTH = 2048
-DISPLAY_HEIGHT = 1600
+DISPLAY_WIDTH = 1024
+DISPLAY_HEIGHT = 800
 MAX_ACTIONS = 40
 TIMEOUT_SECONDS = 400
 PROFILE_BASE_DIR = Path.home() / ".computer-meister-profile"
@@ -175,25 +175,22 @@ def get_profile_paths(url: str) -> tuple[Path, Path]:
     return profile_dir, profile_dir / "storage_state.json"
 
 
-async def take_screenshot(page, artifacts_dir: Path, step: int | str = "") -> tuple[str, bytes]:
+async def take_screenshot(page, step: int | str = "") -> tuple[str, bytes]:
     """Take a screenshot and return (base64_str, raw_bytes)."""
     raw = await page.screenshot()
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    # Save artifact
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = artifacts_dir / f"screenshot_{ts}_{step}.png"
+    path = ARTIFACTS_DIR / f"screenshot_{ts}_{step}.png"
     path.write_bytes(raw)
     return base64.b64encode(raw).decode(), raw
-
-
-def get_artifact_dir(url: str) -> Path:
-    return ARTIFACTS_DIR / get_profile_key(url)
 
 
 def log(msg: str) -> None:
     print(f"  {msg}", flush=True)
 
 
-def launch_context_kwargs(*, headless: bool) -> dict:
+def launch_context_kwargs(*, headless: bool, use_chrome_channel: bool = False) -> dict:
     kwargs = {
         "headless": headless,
         "user_agent": DEFAULT_USER_AGENT,
@@ -201,6 +198,8 @@ def launch_context_kwargs(*, headless: bool) -> dict:
         "viewport": {"width": DISPLAY_WIDTH, "height": DISPLAY_HEIGHT},
         "device_scale_factor": 1,
     }
+    if use_chrome_channel:
+        kwargs["channel"] = "chrome"
     return kwargs
 
 
@@ -299,14 +298,7 @@ def check_logged_in(client: OpenAI, screenshot_b64: str, url: str) -> bool:
 
 # ── Human login flow ────────────────────────────────────────────────────────
 
-async def human_login_flow(
-    playwright,
-    client: OpenAI,
-    url: str,
-    profile_dir: Path,
-    storage_state_path: Path,
-    artifacts_dir: Path,
-) -> None:
+async def human_login_flow(playwright, client: OpenAI, url: str, profile_dir: Path, storage_state_path: Path) -> None:
     """Check if logged in; if not, open a visible browser for manual login."""
     log("Checking login status...")
 
@@ -321,7 +313,7 @@ async def human_login_flow(
                 pass
 
     async def _try_login_check_navigation(context, page_obj):
-        """Try navigating for login check, escalating from headless to headed."""
+        """Try navigating for login check, escalating through headed/chrome fallbacks."""
         try:
             await goto_with_fallback(page_obj, url, wait_until="commit", timeout=15000)
             return context, page_obj
@@ -342,7 +334,22 @@ async def human_login_flow(
             return context, page_obj
         except Exception as e:
             log(f"Headed login check failed: {e}")
-        raise
+
+        # Try headed mode with system Chrome
+        await context.close()
+        log("Retrying login check with channel='chrome'.")
+        context = await playwright.chromium.launch_persistent_context(
+            str(profile_dir),
+            **launch_context_kwargs(headless=False, use_chrome_channel=True),
+        )
+        page_obj = context.pages[0] if context.pages else await context.new_page()
+        await _restore_cookies(context)
+        try:
+            await goto_with_fallback(page_obj, url, wait_until="commit", timeout=20000)
+            return context, page_obj
+        except Exception as e:
+            log(f"Chrome channel login check failed: {e}")
+            raise
 
     ctx = await playwright.chromium.launch_persistent_context(
         str(profile_dir),
@@ -364,7 +371,7 @@ async def human_login_flow(
         print("\n>>> Please log in in the browser, then come back here and press ENTER to continue. <<<\n")
         ctx = await playwright.chromium.launch_persistent_context(
             str(profile_dir),
-            **launch_context_kwargs(headless=False),
+            **launch_context_kwargs(headless=False, use_chrome_channel=True),
         )
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         await _restore_cookies(ctx)
@@ -380,7 +387,7 @@ async def human_login_flow(
         log("Browser closed. Session saved.")
         return
     await asyncio.sleep(2)
-    screenshot_b64, _ = await take_screenshot(page, artifacts_dir, "login_check")
+    screenshot_b64, _ = await take_screenshot(page, "login_check")
     logged_in = check_logged_in(client, screenshot_b64, url)
     await ctx.close()
 
@@ -392,7 +399,7 @@ async def human_login_flow(
     print("\n>>> Please log in in the browser, then come back here and press ENTER to continue. <<<\n")
     ctx = await playwright.chromium.launch_persistent_context(
         str(profile_dir),
-        **launch_context_kwargs(headless=False),
+        **launch_context_kwargs(headless=False, use_chrome_channel=True),
     )
     page = ctx.pages[0] if ctx.pages else await ctx.new_page()
     try:
@@ -419,7 +426,6 @@ async def cua_loop(
     question: str,
     profile_dir: Path,
     storage_state_path: Path,
-    artifacts_dir: Path,
     clicks_only: bool = False,
 ) -> str:
     """Run the Computer Use Agent loop and return the final answer."""
@@ -458,10 +464,22 @@ async def cua_loop(
             )
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             await restore_storage_state(ctx)
-            await goto_with_fallback(page, url, wait_until="domcontentloaded", timeout=45000)
+            try:
+                await goto_with_fallback(page, url, wait_until="domcontentloaded", timeout=45000)
+            except Exception as headed_nav_error:
+                log(f"Headed bundled Chromium failed: {headed_nav_error}")
+                log("Retrying with channel='chrome'.")
+                await ctx.close()
+                ctx = await playwright.chromium.launch_persistent_context(
+                    str(profile_dir),
+                    **launch_context_kwargs(headless=False, use_chrome_channel=True),
+                )
+                page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+                await restore_storage_state(ctx)
+                await goto_with_fallback(page, url, wait_until="domcontentloaded", timeout=45000)
         await asyncio.sleep(2)
 
-        screenshot_b64, _ = await take_screenshot(page, artifacts_dir, "initial")
+        screenshot_b64, _ = await take_screenshot(page, "initial")
 
         tools = [
             {
@@ -532,7 +550,7 @@ async def cua_loop(
 
             # Brief pause for page to settle
             await asyncio.sleep(0.5)
-            screenshot_b64, _ = await take_screenshot(page, artifacts_dir, f"action_{action_count}")
+            screenshot_b64, _ = await take_screenshot(page, f"action_{action_count}")
 
             # Build the follow-up input
             call_output: dict = {
@@ -583,7 +601,6 @@ async def run_browser_query_async(
     url = ensure_url(url)
     api_key = load_openai_api_key()
     client = OpenAI(api_key=api_key)
-    artifacts_dir = get_artifact_dir(url)
 
     profile_dir, storage_state_path = get_profile_paths(url)
     profile_dir.mkdir(parents=True, exist_ok=True)
@@ -599,7 +616,7 @@ async def run_browser_query_async(
 
     async with async_playwright() as pw:
         if human_login:
-            await human_login_flow(pw, client, url, profile_dir, storage_state_path, artifacts_dir)
+            await human_login_flow(pw, client, url, profile_dir, storage_state_path)
 
         answer = await cua_loop(
             pw,
@@ -608,17 +625,15 @@ async def run_browser_query_async(
             question,
             profile_dir,
             storage_state_path,
-            artifacts_dir,
             clicks_only=clicks_only,
         )
 
     run_meta["finished_at"] = datetime.now().isoformat()
-    run_meta["artifacts_dir"] = str(artifacts_dir)
     run_meta["answer"] = answer
 
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    meta_path = artifacts_dir / f"run_{ts}.json"
+    meta_path = ARTIFACTS_DIR / f"run_{ts}.json"
     meta_path.write_text(json.dumps(run_meta, indent=2))
     return answer
 
@@ -681,7 +696,7 @@ async def async_main() -> None:
     print("ANSWER:")
     print(answer)
     print(f"{'=' * 60}")
-    print(f"\nArtifacts saved to {get_artifact_dir(url)}/")
+    print(f"\nArtifacts saved to {ARTIFACTS_DIR}/")
 
 
 def main() -> None:
