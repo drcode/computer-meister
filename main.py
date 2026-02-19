@@ -210,6 +210,58 @@ def launch_context_kwargs(*, headless: bool) -> dict:
 
 # ── Action execution ────────────────────────────────────────────────────────
 
+def normalize_playwright_key(raw_key: Any) -> str:
+    """Normalize model-provided key tokens/chords to Playwright key names."""
+    key = str(raw_key).strip()
+    if not key:
+        return key
+
+    alias = {
+        "enter": "Enter",
+        "return": "Enter",
+        "esc": "Escape",
+        "escape": "Escape",
+        "tab": "Tab",
+        "space": "Space",
+        "spacebar": "Space",
+        "backspace": "Backspace",
+        "delete": "Delete",
+        "del": "Delete",
+        "insert": "Insert",
+        "home": "Home",
+        "end": "End",
+        "pageup": "PageUp",
+        "pagedown": "PageDown",
+        "up": "ArrowUp",
+        "down": "ArrowDown",
+        "left": "ArrowLeft",
+        "right": "ArrowRight",
+        "arrowup": "ArrowUp",
+        "arrowdown": "ArrowDown",
+        "arrowleft": "ArrowLeft",
+        "arrowright": "ArrowRight",
+        "shift": "Shift",
+        "ctrl": "Control",
+        "control": "Control",
+        "alt": "Alt",
+        "option": "Alt",
+        "meta": "Meta",
+        "cmd": "Meta",
+        "command": "Meta",
+        "super": "Meta",
+    }
+
+    def normalize_part(part: str) -> str:
+        p = part.strip()
+        if not p:
+            return p
+        return alias.get(p.lower(), p if len(p) == 1 else p[:1].upper() + p[1:].lower())
+
+    if "+" in key:
+        return "+".join(normalize_part(part) for part in key.split("+"))
+    return normalize_part(key)
+
+
 async def execute_action(page, action: dict) -> None:
     action_type = action["type"]
 
@@ -234,7 +286,7 @@ async def execute_action(page, action: dict) -> None:
         keys = action["keys"]
         log(f"keypress {keys}")
         for key in keys:
-            await page.keyboard.press(key)
+            await page.keyboard.press(normalize_playwright_key(key))
 
     elif action_type == "scroll":
         x, y = action["x"], action["y"]
