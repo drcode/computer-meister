@@ -88,19 +88,6 @@ def ensure_url(url: str) -> str:
     return url
 
 
-def add_www_subdomain(url: str) -> str:
-    parsed = urlparse(url)
-    host = (parsed.hostname or "").lower()
-    if not host or host.startswith("www."):
-        return url
-    netloc = parsed.netloc
-    if parsed.port:
-        netloc = f"www.{host}:{parsed.port}"
-    else:
-        netloc = f"www.{host}"
-    return urlunparse((parsed.scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
-
-
 def navigation_candidates(url: str) -> list[str]:
     base = ensure_url(url)
     parsed = urlparse(base)
@@ -111,11 +98,7 @@ def navigation_candidates(url: str) -> list[str]:
     fragment = parsed.fragment
     port = f":{parsed.port}" if parsed.port else ""
 
-    hosts: list[str] = []
-    if host:
-        hosts.append(host)
-        if not host.startswith("www."):
-            hosts.append(f"www.{host}")
+    hosts: list[str] = [host] if host else []
 
     schemes = [scheme]
 
