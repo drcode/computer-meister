@@ -13,20 +13,24 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse, urlunparse
 
+from anthropic import Anthropic
 from openai import OpenAI
 from playwright.async_api import async_playwright
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-DISPLAY_WIDTH = 1024
-DISPLAY_HEIGHT = 800
+DISPLAY_WIDTH = 2048
+DISPLAY_HEIGHT = 1600
 MAX_ACTIONS = 40
 TIMEOUT_SECONDS = 400
 PROFILE_BASE_DIR = Path.home() / ".computer-meister-profile"
 ARTIFACTS_DIR = Path("artifacts")
 CUA_MODEL = "computer-use-preview"
+CLAUDE_CUA_MODEL = "claude-sonnet-4-5"
+CLAUDE_COMPUTER_BETA = "computer-use-2025-01-24"
 LOGIN_CHECK_MODEL = "gpt-4o-mini"
 
 DEFAULT_URL = "https://weather.com"
@@ -77,6 +81,23 @@ def load_openai_api_key() -> str:
         return key
     raise RuntimeError(
         "OpenAI API key not found. Set OPENAI_API_KEY or place openai_api_key.txt in/above the working directory."
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def load_anthropic_api_key() -> str:
+    v = os.environ.get("ANTHROPIC_API_KEY")
+    if v and v.strip():
+        return v.strip()
+    extra_paths = [
+        Path("/opt/anthropic_api_key.txt"),
+        Path.home() / ".anthropic_api_key.txt",
+    ]
+    key = _find_key_file("anthropic_api_key.txt", extra_paths=extra_paths)
+    if key:
+        return key
+    raise RuntimeError(
+        "Anthropic API key not found. Set ANTHROPIC_API_KEY or place anthropic_api_key.txt in/above the working directory."
     )
 
 
@@ -158,22 +179,25 @@ def get_profile_paths(url: str) -> tuple[Path, Path]:
     return profile_dir, profile_dir / "storage_state.json"
 
 
-async def take_screenshot(page, step: int | str = "") -> tuple[str, bytes]:
+async def take_screenshot(page, artifacts_dir: Path, step: int | str = "") -> tuple[str, bytes]:
     """Take a screenshot and return (base64_str, raw_bytes)."""
     raw = await page.screenshot()
-    # Save artifact
-    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    path = ARTIFACTS_DIR / f"screenshot_{ts}_{step}.png"
+    path = artifacts_dir / f"screenshot_{ts}_{step}.png"
     path.write_bytes(raw)
     return base64.b64encode(raw).decode(), raw
+
+
+def get_artifact_dir(url: str) -> Path:
+    return ARTIFACTS_DIR / get_profile_key(url)
 
 
 def log(msg: str) -> None:
     print(f"  {msg}", flush=True)
 
 
-def launch_context_kwargs(*, headless: bool, use_chrome_channel: bool = False) -> dict:
+def launch_context_kwargs(*, headless: bool) -> dict:
     kwargs = {
         "headless": headless,
         "user_agent": DEFAULT_USER_AGENT,
@@ -181,12 +205,62 @@ def launch_context_kwargs(*, headless: bool, use_chrome_channel: bool = False) -
         "viewport": {"width": DISPLAY_WIDTH, "height": DISPLAY_HEIGHT},
         "device_scale_factor": 1,
     }
-    if use_chrome_channel:
-        kwargs["channel"] = "chrome"
     return kwargs
 
 
 # ── Action execution ────────────────────────────────────────────────────────
+
+def normalize_playwright_key(raw_key: Any) -> str:
+    """Normalize model-provided key tokens/chords to Playwright key names."""
+    key = str(raw_key).strip()
+    if not key:
+        return key
+
+    alias = {
+        "enter": "Enter",
+        "return": "Enter",
+        "esc": "Escape",
+        "escape": "Escape",
+        "tab": "Tab",
+        "space": "Space",
+        "spacebar": "Space",
+        "backspace": "Backspace",
+        "delete": "Delete",
+        "del": "Delete",
+        "insert": "Insert",
+        "home": "Home",
+        "end": "End",
+        "pageup": "PageUp",
+        "pagedown": "PageDown",
+        "up": "ArrowUp",
+        "down": "ArrowDown",
+        "left": "ArrowLeft",
+        "right": "ArrowRight",
+        "arrowup": "ArrowUp",
+        "arrowdown": "ArrowDown",
+        "arrowleft": "ArrowLeft",
+        "arrowright": "ArrowRight",
+        "shift": "Shift",
+        "ctrl": "Control",
+        "control": "Control",
+        "alt": "Alt",
+        "option": "Alt",
+        "meta": "Meta",
+        "cmd": "Meta",
+        "command": "Meta",
+        "super": "Meta",
+    }
+
+    def normalize_part(part: str) -> str:
+        p = part.strip()
+        if not p:
+            return p
+        return alias.get(p.lower(), p if len(p) == 1 else p[:1].upper() + p[1:].lower())
+
+    if "+" in key:
+        return "+".join(normalize_part(part) for part in key.split("+"))
+    return normalize_part(key)
+
 
 async def execute_action(page, action: dict) -> None:
     action_type = action["type"]
@@ -212,7 +286,7 @@ async def execute_action(page, action: dict) -> None:
         keys = action["keys"]
         log(f"keypress {keys}")
         for key in keys:
-            await page.keyboard.press(key)
+            await page.keyboard.press(normalize_playwright_key(key))
 
     elif action_type == "scroll":
         x, y = action["x"], action["y"]
@@ -248,6 +322,111 @@ async def execute_action(page, action: dict) -> None:
         log(f"unknown action type: {action_type}")
 
 
+# ── Claude computer-use helpers ─────────────────────────────────────────────
+
+def _coord_from_input(payload: dict[str, Any], key: str = "coordinate") -> tuple[int, int] | None:
+    coord = payload.get(key)
+    if isinstance(coord, list) and len(coord) >= 2:
+        return int(coord[0]), int(coord[1])
+    return None
+
+
+def claude_action_to_local_action(payload: dict[str, Any]) -> dict[str, Any]:
+    action = payload.get("action")
+
+    if action in {"left_click", "right_click", "middle_click", "double_click"}:
+        xy = _coord_from_input(payload)
+        if not xy:
+            raise ValueError(f"Missing coordinate for {action}")
+        x, y = xy
+        if action == "double_click":
+            return {"type": "double_click", "x": x, "y": y}
+        button = "left" if action == "left_click" else "right" if action == "right_click" else "middle"
+        return {"type": "click", "x": x, "y": y, "button": button}
+
+    if action == "left_click_drag":
+        start = _coord_from_input(payload, "start_coordinate")
+        end = _coord_from_input(payload, "end_coordinate")
+        if not start or not end:
+            raise ValueError("Missing drag coordinates")
+        return {
+            "type": "drag",
+            "path": [
+                {"x": start[0], "y": start[1]},
+                {"x": end[0], "y": end[1]},
+            ],
+        }
+
+    if action == "mouse_move":
+        xy = _coord_from_input(payload)
+        if not xy:
+            raise ValueError("Missing coordinate for mouse_move")
+        return {"type": "move", "x": xy[0], "y": xy[1]}
+
+    if action == "key":
+        keys = payload.get("keys")
+        if isinstance(keys, list) and keys:
+            return {"type": "keypress", "keys": [str(k) for k in keys]}
+        text = payload.get("text")
+        if isinstance(text, str) and text:
+            return {"type": "keypress", "keys": [text]}
+        raise ValueError("Missing keys/text for key action")
+
+    if action == "type":
+        text = payload.get("text")
+        if not isinstance(text, str):
+            raise ValueError("Missing text for type action")
+        return {"type": "type", "text": text}
+
+    if action == "scroll":
+        xy = _coord_from_input(payload) or (DISPLAY_WIDTH // 2, DISPLAY_HEIGHT // 2)
+        amount = int(payload.get("scroll_amount", 600))
+        # Claude may emit small line-based amounts (e.g. 2/3). Playwright wheel
+        # expects pixel-ish deltas, so normalize tiny values to useful movement.
+        if amount == 0:
+            amount = 600
+        elif abs(amount) <= 10:
+            amount *= 120
+        direction = str(payload.get("scroll_direction", "down")).lower()
+        dx, dy = 0, amount
+        if direction == "up":
+            dy = -amount
+        elif direction == "left":
+            dx, dy = -amount, 0
+        elif direction == "right":
+            dx, dy = amount, 0
+        return {"type": "scroll", "x": xy[0], "y": xy[1], "scroll_x": dx, "scroll_y": dy}
+
+    if action == "screenshot":
+        return {"type": "screenshot"}
+
+    if action == "wait":
+        return {"type": "wait", "ms": int(payload.get("duration_ms", 500))}
+
+    raise ValueError(f"Unsupported Claude action: {action}")
+
+
+def claude_tool_result_with_screenshot(tool_use_id: str, screenshot_b64: str, error: str | None = None) -> dict[str, Any]:
+    content: list[dict[str, Any]] = []
+    if error:
+        content.append({"type": "text", "text": error})
+    content.append(
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": screenshot_b64,
+            },
+        }
+    )
+    return {
+        "type": "tool_result",
+        "tool_use_id": tool_use_id,
+        "content": content,
+    }
+
+
 # ── Login check ──────────────────────────────────────────────────────────────
 
 def check_logged_in(client: OpenAI, screenshot_b64: str, url: str) -> bool:
@@ -281,9 +460,34 @@ def check_logged_in(client: OpenAI, screenshot_b64: str, url: str) -> bool:
 
 # ── Human login flow ────────────────────────────────────────────────────────
 
-async def human_login_flow(playwright, client: OpenAI, url: str, profile_dir: Path, storage_state_path: Path) -> None:
+async def human_login_flow(
+    playwright,
+    client: OpenAI | None,
+    url: str,
+    profile_dir: Path,
+    storage_state_path: Path,
+    artifacts_dir: Path,
+) -> None:
     """Check if logged in; if not, open a visible browser for manual login."""
     log("Checking login status...")
+    if client is None:
+        log("No OpenAI key available for visual login check; opening manual login directly.")
+        print("\n>>> Please log in in the browser, then come back here and press ENTER to continue. <<<\n")
+        ctx = await playwright.chromium.launch_persistent_context(
+            str(profile_dir),
+            **launch_context_kwargs(headless=False),
+        )
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+        try:
+            await goto_with_fallback(page, url, wait_until="commit", timeout=30000)
+        except Exception as e:
+            log(f"Manual login auto-navigation failed: {e}")
+            print(f">>> Please manually navigate to {url} in the opened browser before pressing ENTER. <<<\n")
+        await asyncio.get_event_loop().run_in_executor(None, input)
+        await ctx.storage_state(path=str(storage_state_path))
+        await ctx.close()
+        log("Browser closed. Session saved.")
+        return
 
     async def _restore_cookies(context):
         if storage_state_path.exists():
@@ -296,7 +500,7 @@ async def human_login_flow(playwright, client: OpenAI, url: str, profile_dir: Pa
                 pass
 
     async def _try_login_check_navigation(context, page_obj):
-        """Try navigating for login check, escalating through headed/chrome fallbacks."""
+        """Try navigating for login check, escalating from headless to headed."""
         try:
             await goto_with_fallback(page_obj, url, wait_until="commit", timeout=15000)
             return context, page_obj
@@ -317,22 +521,7 @@ async def human_login_flow(playwright, client: OpenAI, url: str, profile_dir: Pa
             return context, page_obj
         except Exception as e:
             log(f"Headed login check failed: {e}")
-
-        # Try headed mode with system Chrome
-        await context.close()
-        log("Retrying login check with channel='chrome'.")
-        context = await playwright.chromium.launch_persistent_context(
-            str(profile_dir),
-            **launch_context_kwargs(headless=False, use_chrome_channel=True),
-        )
-        page_obj = context.pages[0] if context.pages else await context.new_page()
-        await _restore_cookies(context)
-        try:
-            await goto_with_fallback(page_obj, url, wait_until="commit", timeout=20000)
-            return context, page_obj
-        except Exception as e:
-            log(f"Chrome channel login check failed: {e}")
-            raise
+        raise
 
     ctx = await playwright.chromium.launch_persistent_context(
         str(profile_dir),
@@ -354,7 +543,7 @@ async def human_login_flow(playwright, client: OpenAI, url: str, profile_dir: Pa
         print("\n>>> Please log in in the browser, then come back here and press ENTER to continue. <<<\n")
         ctx = await playwright.chromium.launch_persistent_context(
             str(profile_dir),
-            **launch_context_kwargs(headless=False, use_chrome_channel=True),
+            **launch_context_kwargs(headless=False),
         )
         page = ctx.pages[0] if ctx.pages else await ctx.new_page()
         await _restore_cookies(ctx)
@@ -370,7 +559,7 @@ async def human_login_flow(playwright, client: OpenAI, url: str, profile_dir: Pa
         log("Browser closed. Session saved.")
         return
     await asyncio.sleep(2)
-    screenshot_b64, _ = await take_screenshot(page, "login_check")
+    screenshot_b64, _ = await take_screenshot(page, artifacts_dir, "login_check")
     logged_in = check_logged_in(client, screenshot_b64, url)
     await ctx.close()
 
@@ -382,7 +571,7 @@ async def human_login_flow(playwright, client: OpenAI, url: str, profile_dir: Pa
     print("\n>>> Please log in in the browser, then come back here and press ENTER to continue. <<<\n")
     ctx = await playwright.chromium.launch_persistent_context(
         str(profile_dir),
-        **launch_context_kwargs(headless=False, use_chrome_channel=True),
+        **launch_context_kwargs(headless=False),
     )
     page = ctx.pages[0] if ctx.pages else await ctx.new_page()
     try:
@@ -409,6 +598,7 @@ async def cua_loop(
     question: str,
     profile_dir: Path,
     storage_state_path: Path,
+    artifacts_dir: Path,
     clicks_only: bool = False,
 ) -> str:
     """Run the Computer Use Agent loop and return the final answer."""
@@ -447,22 +637,10 @@ async def cua_loop(
             )
             page = ctx.pages[0] if ctx.pages else await ctx.new_page()
             await restore_storage_state(ctx)
-            try:
-                await goto_with_fallback(page, url, wait_until="domcontentloaded", timeout=45000)
-            except Exception as headed_nav_error:
-                log(f"Headed bundled Chromium failed: {headed_nav_error}")
-                log("Retrying with channel='chrome'.")
-                await ctx.close()
-                ctx = await playwright.chromium.launch_persistent_context(
-                    str(profile_dir),
-                    **launch_context_kwargs(headless=False, use_chrome_channel=True),
-                )
-                page = ctx.pages[0] if ctx.pages else await ctx.new_page()
-                await restore_storage_state(ctx)
-                await goto_with_fallback(page, url, wait_until="domcontentloaded", timeout=45000)
+            await goto_with_fallback(page, url, wait_until="domcontentloaded", timeout=45000)
         await asyncio.sleep(2)
 
-        screenshot_b64, _ = await take_screenshot(page, "initial")
+        screenshot_b64, _ = await take_screenshot(page, artifacts_dir, "initial")
 
         tools = [
             {
@@ -533,7 +711,7 @@ async def cua_loop(
 
             # Brief pause for page to settle
             await asyncio.sleep(0.5)
-            screenshot_b64, _ = await take_screenshot(page, f"action_{action_count}")
+            screenshot_b64, _ = await take_screenshot(page, artifacts_dir, f"action_{action_count}")
 
             # Build the follow-up input
             call_output: dict = {
@@ -572,6 +750,156 @@ async def cua_loop(
         await ctx.close()
 
 
+async def cua_loop_claude(
+    playwright,
+    client: Anthropic,
+    url: str,
+    question: str,
+    profile_dir: Path,
+    storage_state_path: Path,
+    artifacts_dir: Path,
+    clicks_only: bool = False,
+) -> str:
+    """Run Claude computer-use loop and return the final answer."""
+    async def restore_storage_state(context) -> None:
+        if not storage_state_path.exists():
+            return
+        try:
+            state = json.loads(storage_state_path.read_text())
+            cookies = state.get("cookies", [])
+            if cookies:
+                await context.add_cookies(cookies)
+                log(f"Restored {len(cookies)} saved cookies.")
+        except Exception as e:
+            log(f"Warning: could not restore saved state: {e}")
+
+    ctx = await playwright.chromium.launch_persistent_context(
+        str(profile_dir),
+        **launch_context_kwargs(headless=True),
+    )
+    page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+    await restore_storage_state(ctx)
+
+    try:
+        print(f"\nNavigating to {url} ...")
+        try:
+            await goto_with_fallback(page, url, wait_until="domcontentloaded", timeout=30000)
+        except Exception as nav_error:
+            log(f"Headless navigation failed: {nav_error}")
+            log("Retrying navigation in headed mode.")
+            await ctx.close()
+            ctx = await playwright.chromium.launch_persistent_context(
+                str(profile_dir),
+                **launch_context_kwargs(headless=False),
+            )
+            page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+            await restore_storage_state(ctx)
+            await goto_with_fallback(page, url, wait_until="domcontentloaded", timeout=45000)
+        await asyncio.sleep(2)
+
+        screenshot_b64, _ = await take_screenshot(page, artifacts_dir, "initial")
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": question},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": screenshot_b64,
+                        },
+                    },
+                ],
+            }
+        ]
+
+        tools = [
+            {
+                "type": "computer_20250124",
+                "name": "computer",
+                "display_width_px": DISPLAY_WIDTH,
+                "display_height_px": DISPLAY_HEIGHT,
+                "display_number": 1,
+            }
+        ]
+
+        start_time = time.time()
+        action_count = 0
+
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed > TIMEOUT_SECONDS:
+                print(f"\nTimeout reached ({TIMEOUT_SECONDS}s). Stopping.")
+                return "Timeout reached before a final answer."
+
+            response = client.beta.messages.create(
+                model=CLAUDE_CUA_MODEL,
+                max_tokens=1024,
+                messages=messages,
+                tools=tools,
+                betas=[CLAUDE_COMPUTER_BETA],
+            )
+
+            tool_uses = [item for item in response.content if getattr(item, "type", None) == "tool_use"]
+            text_parts = [item.text for item in response.content if getattr(item, "type", None) == "text"]
+
+            if not tool_uses:
+                answer = "\n".join(text_parts).strip()
+                return answer or "No answer obtained."
+
+            assistant_content: list[dict[str, Any]] = []
+            for item in response.content:
+                item_type = getattr(item, "type", None)
+                if item_type == "text":
+                    assistant_content.append({"type": "text", "text": item.text})
+                elif item_type == "tool_use":
+                    assistant_content.append(
+                        {
+                            "type": "tool_use",
+                            "id": item.id,
+                            "name": item.name,
+                            "input": item.input,
+                        }
+                    )
+            messages.append({"role": "assistant", "content": assistant_content})
+
+            tool_results: list[dict[str, Any]] = []
+            for tool_use in tool_uses:
+                action_count += 1
+                if action_count > MAX_ACTIONS:
+                    print(f"\nMax actions ({MAX_ACTIONS}) reached. Stopping.")
+                    answer = "\n".join(text_parts).strip()
+                    return answer or "Max actions reached without a final answer."
+
+                action_payload = dict(tool_use.input)
+                action_error: str | None = None
+
+                print(f"\n[Action {action_count}/{MAX_ACTIONS}] ", end="")
+                try:
+                    local_action = claude_action_to_local_action(action_payload)
+                    is_click = local_action.get("type") == "click"
+                    if clicks_only and not is_click:
+                        log(f"filtered non-click action: {local_action.get('type')}")
+                    else:
+                        await execute_action(page, local_action)
+                except Exception as e:
+                    action_error = f"Action execution error: {e}"
+                    log(action_error)
+
+                await asyncio.sleep(0.5)
+                screenshot_b64, _ = await take_screenshot(page, artifacts_dir, f"action_{action_count}")
+                tool_results.append(
+                    claude_tool_result_with_screenshot(tool_use.id, screenshot_b64, error=action_error)
+                )
+
+            messages.append({"role": "user", "content": tool_results})
+
+    finally:
+        await ctx.close()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 async def run_browser_query_async(
@@ -579,11 +907,11 @@ async def run_browser_query_async(
     question: str,
     *,
     human_login: bool = False,
+    claude: bool = False,
     clicks_only: bool = False,
 ) -> str:
     url = ensure_url(url)
-    api_key = load_openai_api_key()
-    client = OpenAI(api_key=api_key)
+    artifacts_dir = get_artifact_dir(url)
 
     profile_dir, storage_state_path = get_profile_paths(url)
     profile_dir.mkdir(parents=True, exist_ok=True)
@@ -592,31 +920,60 @@ async def run_browser_query_async(
         "url": url,
         "question": question,
         "human_login": human_login,
+        "claude": claude,
         "clicks_only": clicks_only,
         "started_at": datetime.now().isoformat(),
         "actions": [],
     }
 
     async with async_playwright() as pw:
-        if human_login:
-            await human_login_flow(pw, client, url, profile_dir, storage_state_path)
+        login_check_client: OpenAI | None = None
+        if claude:
+            anthropic_client = Anthropic(api_key=load_anthropic_api_key())
+            if human_login:
+                try:
+                    login_check_client = OpenAI(api_key=load_openai_api_key())
+                except Exception:
+                    login_check_client = None
+        else:
+            openai_client = OpenAI(api_key=load_openai_api_key())
+            login_check_client = openai_client
 
-        answer = await cua_loop(
-            pw,
-            client,
-            url,
-            question,
-            profile_dir,
-            storage_state_path,
-            clicks_only=clicks_only,
-        )
+        if human_login:
+            await human_login_flow(
+                pw, login_check_client, url, profile_dir, storage_state_path, artifacts_dir
+            )
+
+        if claude:
+            answer = await cua_loop_claude(
+                pw,
+                anthropic_client,
+                url,
+                question,
+                profile_dir,
+                storage_state_path,
+                artifacts_dir,
+                clicks_only=clicks_only,
+            )
+        else:
+            answer = await cua_loop(
+                pw,
+                openai_client,
+                url,
+                question,
+                profile_dir,
+                storage_state_path,
+                artifacts_dir,
+                clicks_only=clicks_only,
+            )
 
     run_meta["finished_at"] = datetime.now().isoformat()
+    run_meta["artifacts_dir"] = str(artifacts_dir)
     run_meta["answer"] = answer
 
-    ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    meta_path = ARTIFACTS_DIR / f"run_{ts}.json"
+    meta_path = artifacts_dir / f"run_{ts}.json"
     meta_path.write_text(json.dumps(run_meta, indent=2))
     return answer
 
@@ -626,6 +983,7 @@ def run_browser_query(
     question: str,
     *,
     human_login: bool = False,
+    claude: bool = False,
     clicks_only: bool = False,
 ) -> str:
     return asyncio.run(
@@ -633,6 +991,7 @@ def run_browser_query(
             url=url,
             question=question,
             human_login=human_login,
+            claude=claude,
             clicks_only=clicks_only,
         )
     )
@@ -650,6 +1009,11 @@ async def async_main() -> None:
         help="Check login status and allow manual login if needed",
     )
     parser.add_argument(
+        "--claude",
+        action="store_true",
+        help="Use Anthropic Claude computer-use agent instead of OpenAI computer-use-preview",
+    )
+    parser.add_argument(
         "--clicks-only",
         action="store_true",
         help="Filter out all non-click model actions",
@@ -659,12 +1023,15 @@ async def async_main() -> None:
     url = ensure_url(args.url)
     question = args.question
     human_login = args.human_login
+    claude = args.claude
     clicks_only = args.clicks_only
 
     print(f"URL:      {url}")
     print(f"Question: {question}")
     if human_login:
         print("Mode:     human-login enabled")
+    if claude:
+        print("Mode:     claude enabled")
     if clicks_only:
         print("Mode:     clicks-only enabled")
 
@@ -672,6 +1039,7 @@ async def async_main() -> None:
         url=url,
         question=question,
         human_login=human_login,
+        claude=claude,
         clicks_only=clicks_only,
     )
 
@@ -679,7 +1047,7 @@ async def async_main() -> None:
     print("ANSWER:")
     print(answer)
     print(f"{'=' * 60}")
-    print(f"\nArtifacts saved to {ARTIFACTS_DIR}/")
+    print(f"\nArtifacts saved to {get_artifact_dir(url)}/")
 
 
 def main() -> None:

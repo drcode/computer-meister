@@ -1,3 +1,5 @@
 openai
 playwright
 anthropic
+google-genai
+lxml

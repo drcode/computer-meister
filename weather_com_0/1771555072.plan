@@ -1,0 +1,4 @@
+target_site "https://weather.com"
+enable_text_entry
+explore_website_openai "Search for Mill Valley, CA in the search bar and navigate to the weather page to find the current temperature." 10
+answer_query_text "The current temperature in Mill Valley, CA."
