@@ -1,0 +1,4 @@
+target_site "https://twitter.com"
+login_required
+explore_website_openai "Navigate to the notifications tab. Scroll down to ensure at least the ten most recent notifications are fully loaded and visible in the view." 10
+answer_query_text "List the ten most recent notifications, including the sender, the type of notification, and the content or timestamp for each."
