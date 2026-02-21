@@ -17,7 +17,7 @@ from playwright.async_api import BrowserContext, Page, async_playwright
 
 from ai import load_openai_api_key, openai
 from html_preprocessor import preprocess_html
-from planning import PlanCommand
+from planning import PlanCommand, render_plan
 from websites import WebsiteQuery
 
 
@@ -261,40 +261,85 @@ def _normalize_key(raw_key: Any) -> str:
     return normalize_piece(key)
 
 
-async def _execute_computer_action(page: Page, action: dict[str, Any], *, allow_text_entry: bool) -> None:
-    action_type = action.get("type")
+def _plan_command_line(command: PlanCommand) -> str:
+    return render_plan([command]).strip()
+
+
+def _plan_command_payload(command: PlanCommand) -> dict[str, Any]:
+    return {
+        "name": command.name,
+        "args": list(command.args),
+        "line": _plan_command_line(command),
+    }
+
+
+def _computer_action_to_plan_command(action: dict[str, Any]) -> PlanCommand:
+    action_type = str(action.get("type", "")).strip()
 
     if action_type == "click":
-        await page.mouse.click(action["x"], action["y"], button=action.get("button", "left"))
-    elif action_type == "double_click":
-        await page.mouse.dblclick(action["x"], action["y"])
-    elif action_type == "type":
-        if not allow_text_entry:
-            raise RuntimeError("text entry attempted but enable_text_entry was not set")
-        await page.keyboard.type(action["text"])
-    elif action_type == "keypress":
-        for key in action.get("keys", []):
-            await page.keyboard.press(_normalize_key(key))
-    elif action_type == "scroll":
-        await page.mouse.move(action.get("x", DISPLAY_WIDTH // 2), action.get("y", DISPLAY_HEIGHT // 2))
-        await page.mouse.wheel(action.get("scroll_x", 0), action.get("scroll_y", 0))
-    elif action_type == "drag":
-        path = action.get("path") or []
-        if len(path) < 2:
-            return
-        await page.mouse.move(path[0]["x"], path[0]["y"])
-        await page.mouse.down()
-        for point in path[1:]:
-            await page.mouse.move(point["x"], point["y"])
-        await page.mouse.up()
-    elif action_type == "wait":
-        await asyncio.sleep(max(0, int(action.get("ms", 500))) / 1000.0)
-    elif action_type == "move":
-        await page.mouse.move(action["x"], action["y"])
-    elif action_type == "screenshot":
+        button = str(action.get("button", "left")).lower()
+        if button != "left":
+            raise RuntimeError(
+                "unsupported click button for plan mapping "
+                f"(expected left): {_dump_json(action)}"
+            )
+        return PlanCommand("click", (int(action["x"]), int(action["y"])))
+
+    if action_type == "type":
+        text = action.get("text")
+        if not isinstance(text, str):
+            raise RuntimeError(f"type action missing string text: {_dump_json(action)}")
+        return PlanCommand("type", (text,))
+
+    if action_type == "keypress":
+        keys = action.get("keys")
+        if not isinstance(keys, list) or not keys:
+            raise RuntimeError(f"keypress action missing keys list: {_dump_json(action)}")
+        return PlanCommand("keypress", tuple(str(key) for key in keys))
+
+    if action_type == "wait":
+        return PlanCommand("wait", (int(action.get("ms", 500)),))
+
+    if action_type == "scroll":
+        scroll_x = int(action.get("scroll_x", 0))
+        if scroll_x != 0:
+            raise RuntimeError(
+                "unsupported horizontal scroll for plan mapping: "
+                f"{_dump_json(action)}"
+            )
+        return PlanCommand("vscroll", (int(action.get("scroll_y", 0)),))
+
+    raise RuntimeError(
+        "unsupported computer action for plan mapping: "
+        f"{_dump_json(action)}"
+    )
+
+
+async def _execute_plan_interaction(page: Page, command: PlanCommand, *, allow_text_entry: bool) -> None:
+    if command.name == "click":
+        await page.mouse.click(int(command.args[0]), int(command.args[1]), button="left")
         return
-    else:
-        raise RuntimeError(f"unsupported computer action: {action_type}")
+
+    if command.name == "type":
+        if not allow_text_entry:
+            raise RuntimeError("type command encountered before enable_text_entry")
+        await page.keyboard.type(str(command.args[0]))
+        return
+
+    if command.name == "keypress":
+        for key in command.args:
+            await page.keyboard.press(_normalize_key(str(key)))
+        return
+
+    if command.name == "wait":
+        await asyncio.sleep(max(0, int(command.args[0])) / 1000.0)
+        return
+
+    if command.name == "vscroll":
+        await page.mouse.wheel(0, int(command.args[0]))
+        return
+
+    raise RuntimeError(f"unsupported plan interaction command: {command.name}")
 
 
 class PlanExecutor:
@@ -411,33 +456,13 @@ class PlanExecutor:
             await self._run_exploration(instruction, max_steps)
             return
 
-        if name == "click":
-            await self.page.mouse.click(int(command.args[0]), int(command.args[1]), button="left")
+        if name in {"click", "type", "keypress", "wait", "vscroll"}:
+            await _execute_plan_interaction(self.page, command, allow_text_entry=self.allow_text_entry)
             await self.recorder.capture(
                 self.page,
-                source="click",
-                metadata={"x": int(command.args[0]), "y": int(command.args[1])},
+                source=name,
+                metadata={"plan_command": _plan_command_payload(command)},
             )
-            return
-
-        if name == "type":
-            if not self.allow_text_entry:
-                raise RuntimeError("type command encountered before enable_text_entry")
-            text = str(command.args[0])
-            await self.page.keyboard.type(text)
-            await self.recorder.capture(self.page, source="type", metadata={"text": text})
-            return
-
-        if name == "wait":
-            ms = int(command.args[0])
-            await asyncio.sleep(max(0, ms) / 1000.0)
-            await self.recorder.capture(self.page, source="wait", metadata={"ms": ms})
-            return
-
-        if name == "vscroll":
-            delta = int(command.args[0])
-            await self.page.mouse.wheel(0, delta)
-            await self.recorder.capture(self.page, source="vscroll", metadata={"delta": delta})
             return
 
         if name == "answer_query_images":
@@ -524,6 +549,7 @@ class PlanExecutor:
 
         initial = await self.recorder.capture(self.page, source="explore_start", metadata={"instruction": instruction})
         initial_b64 = base64.b64encode(initial["screenshot_bytes"]).decode("ascii")
+        latest_view = initial
 
         tools = [
             {
@@ -572,26 +598,44 @@ class PlanExecutor:
                 break
 
             action_obj = computer_call.action
-            action = action_obj.model_dump() if hasattr(action_obj, "model_dump") else dict(action_obj)
-            action_error = None
-            try:
-                await _execute_computer_action(self.page, action, allow_text_entry=self.allow_text_entry)
-            except Exception as exc:  # noqa: BLE001
-                action_error = str(exc)
+            computer_action = action_obj.model_dump() if hasattr(action_obj, "model_dump") else dict(action_obj)
+            action_type = str(computer_action.get("type", "")).strip()
+            if action_type == "screenshot":
+                # Screenshot is a protocol handshake action: respond with the latest frame.
+                captured = latest_view
+                screenshot_b64 = base64.b64encode(captured["screenshot_bytes"]).decode("ascii")
+                step_entry = {
+                    "step": step_idx,
+                    "computer_action": computer_action,
+                    "artifact": captured["event"],
+                    "artifact_reused": True,
+                }
+            else:
+                plan_command = _computer_action_to_plan_command(computer_action)
+                action_error = None
+                try:
+                    await _execute_plan_interaction(self.page, plan_command, allow_text_entry=self.allow_text_entry)
+                except Exception as exc:  # noqa: BLE001
+                    action_error = str(exc)
 
-            captured = await self.recorder.capture(
-                self.page,
-                source="explore_action",
-                metadata={"step": step_idx, "action": action, "error": action_error},
-            )
-            screenshot_b64 = base64.b64encode(captured["screenshot_bytes"]).decode("ascii")
+                captured = await self.recorder.capture(
+                    self.page,
+                    source="explore_action",
+                    metadata={
+                        "step": step_idx,
+                        "plan_command": _plan_command_payload(plan_command),
+                        "error": action_error,
+                    },
+                )
+                latest_view = captured
+                screenshot_b64 = base64.b64encode(captured["screenshot_bytes"]).decode("ascii")
 
-            step_entry = {
-                "step": step_idx,
-                "action": action,
-                "error": action_error,
-                "artifact": captured["event"],
-            }
+                step_entry = {
+                    "step": step_idx,
+                    "plan_command": _plan_command_payload(plan_command),
+                    "error": action_error,
+                    "artifact": captured["event"],
+                }
             steps_out.append(step_entry)
 
             call_output: dict[str, Any] = {

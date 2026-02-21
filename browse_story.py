@@ -304,6 +304,14 @@ def _html_pre(value: Any) -> str:
     return f"<pre>{html.escape(_pretty(value))}</pre>"
 
 
+def _prompt_pre(prompt_value: Any) -> str:
+    if prompt_value is None:
+        return ""
+    if not isinstance(prompt_value, str):
+        prompt_value = _pretty(prompt_value)
+    return f"<pre class=\"prompt\">{html.escape(prompt_value)}</pre>"
+
+
 def _parse_name_and_index(path: Path) -> tuple[str, int | None]:
     match = re.match(r"^(.*)_(\d+)$", path.stem)
     if match:
@@ -427,8 +435,17 @@ def _render_llm_entry(log: LlmLogEntry) -> str:
         parts.append(f"<p><strong>Response summary:</strong> {html.escape(summary)}</p>")
 
     if log.request is not None:
+        request_obj: Any = log.request
+        if isinstance(log.request, dict) and "prompt" in log.request:
+            prompt_value = log.request["prompt"]
+            request_obj = dict(log.request)
+            request_obj.pop("prompt", None)
+            parts.append("<details><summary>Prompt</summary>")
+            parts.append(_prompt_pre(prompt_value))
+            parts.append("</details>")
+
         parts.append("<details><summary>Request</summary>")
-        parts.append(_html_pre(log.request))
+        parts.append(_html_pre(request_obj))
         parts.append("</details>")
 
     if log.response is not None:
@@ -473,19 +490,21 @@ def _render_exploration(runs: list[dict[str, Any]], artifacts_dir: Path, output_
                 if not isinstance(step, dict):
                     continue
                 step_index = step.get("step")
-                action = step.get("action")
+                plan_command = step.get("plan_command") if isinstance(step.get("plan_command"), dict) else {}
+                plan_line = str(plan_command.get("line", "")) if plan_command else ""
+                command_name = str(plan_command.get("name", "")) if plan_command else ""
+                computer_action = step.get("computer_action") if isinstance(step.get("computer_action"), dict) else {}
+                computer_action_type = str(computer_action.get("type", "")) if computer_action else ""
                 error = step.get("error")
                 artifact = step.get("artifact") if isinstance(step.get("artifact"), dict) else {}
                 screenshot_name = artifact.get("screenshot") if isinstance(artifact.get("screenshot"), str) else None
                 page_name = artifact.get("page_html") if isinstance(artifact.get("page_html"), str) else None
 
                 blocks.append('<div class="step">')
-                action_type = ""
-                if isinstance(action, dict):
-                    action_type = str(action.get("type", ""))
+                label = command_name or computer_action_type
                 blocks.append(
                     f"<h4>Step {html.escape(str(step_index))}"
-                    f" {html.escape(action_type) if action_type else ''}</h4>"
+                    f" {html.escape(label) if label else ''}</h4>"
                 )
 
                 if screenshot_name:
@@ -497,9 +516,17 @@ def _render_exploration(runs: list[dict[str, Any]], artifacts_dir: Path, output_
                 if page_name:
                     blocks.append(f"<p class=\"meta\">page snapshot: {html.escape(page_name)}</p>")
 
-                blocks.append("<details><summary>Action payload</summary>")
-                blocks.append(_html_pre(action))
-                blocks.append("</details>")
+                if plan_command:
+                    blocks.append("<details><summary>Plan command</summary>")
+                    if plan_line:
+                        blocks.append(_html_pre(plan_line))
+                    else:
+                        blocks.append(_html_pre(plan_command))
+                    blocks.append("</details>")
+                elif computer_action:
+                    blocks.append("<details><summary>Computer action</summary>")
+                    blocks.append(_html_pre(computer_action))
+                    blocks.append("</details>")
 
                 if error:
                     blocks.append("<details><summary>Action error</summary>")
@@ -529,8 +556,12 @@ def _render_screenshot_gallery(runs: list[dict[str, Any]], artifacts_dir: Path, 
             screenshot_name = artifact.get("screenshot") if isinstance(artifact.get("screenshot"), str) else None
             if not screenshot_name:
                 continue
-            action = step.get("action") if isinstance(step.get("action"), dict) else {}
-            action_type = str(action.get("type", "")) if action else ""
+            plan_command = step.get("plan_command") if isinstance(step.get("plan_command"), dict) else {}
+            if plan_command:
+                action_type = str(plan_command.get("name", ""))
+            else:
+                computer_action = step.get("computer_action") if isinstance(step.get("computer_action"), dict) else {}
+                action_type = str(computer_action.get("type", "")) if computer_action else ""
             step_idx = step.get("step")
             notes[screenshot_name] = f"run {run_index}, step {step_idx}, action {action_type}".strip()
 
@@ -691,6 +722,7 @@ def run_browse_story_mode(*, websites_path: Path) -> None:
     print(f"Generated story HTML: {output_path}", flush=True)
 
     opened = webbrowser.open(output_path.resolve().as_uri())
+
     if opened:
         print("Opened story in default browser.", flush=True)
     else:

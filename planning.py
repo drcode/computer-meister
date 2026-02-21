@@ -147,6 +147,11 @@ def parse_plan_line(line: str) -> PlanCommand:
             raise ValueError("type expects text")
         return PlanCommand(cmd, (" ".join(tokens[1:]),))
 
+    if cmd == "keypress":
+        if len(tokens) < 2:
+            raise ValueError("keypress expects at least one key")
+        return PlanCommand(cmd, tuple(tokens[1:]))
+
     if cmd == "wait":
         if len(tokens) != 2:
             raise ValueError("wait expects milliseconds")
@@ -196,6 +201,9 @@ def render_plan(commands: list[PlanCommand]) -> str:
             lines.append(f"click {int(cmd.args[0])} {int(cmd.args[1])}")
         elif cmd.name == "type":
             lines.append(f'type "{cmd.args[0]}"')
+        elif cmd.name == "keypress":
+            keys = " ".join(shlex.quote(str(key)) for key in cmd.args)
+            lines.append(f"keypress {keys}")
         elif cmd.name == "wait":
             lines.append(f"wait {int(cmd.args[0])}")
         elif cmd.name == "vscroll":
@@ -205,51 +213,6 @@ def render_plan(commands: list[PlanCommand]) -> str:
         else:
             raise ValueError(f"cannot render command: {cmd.name}")
     return "\n".join(lines) + "\n"
-
-
-def _is_login_likely(query: WebsiteQuery) -> bool:
-    site = query.site.lower()
-    text = query.query.lower()
-    login_sites = {
-        "twitter.com",
-        "x.com",
-        "facebook.com",
-        "instagram.com",
-        "linkedin.com",
-        "etrade.com",
-        "fidelity.com",
-        "bankofamerica.com",
-        "chase.com",
-        "gmail.com",
-    }
-    login_hints = [
-        "notifications",
-        "my ",
-        "portfolio",
-        "holdings",
-        "cash balance",
-        "account",
-        "feed",
-        "inbox",
-    ]
-    return site in login_sites or any(hint in text for hint in login_hints)
-
-
-def _is_text_entry_likely(query: WebsiteQuery) -> bool:
-    text = query.query.lower()
-    hints = [
-        "find the price",
-        "price of",
-        "ticker",
-        "symbol",
-        "search",
-        "look up",
-        "zip code",
-        "city",
-        "in ",
-        "for ",
-    ]
-    return any(hint in text for hint in hints)
 
 
 def _result_body(results_md: str) -> str:
@@ -304,43 +267,26 @@ def load_attempt_history(query_dir: Path) -> list[AttemptHistory]:
     return [item[1] for item in entries][-MAX_HISTORY_ATTEMPTS:]
 
 
-def _make_initial_prompt(query: WebsiteQuery) -> str:
-    needs_login = _is_login_likely(query)
-    needs_text_entry = _is_text_entry_likely(query)
+def _plan_file_format_docs() -> str:
+    docs_path = Path(__file__).resolve().parent / "docs" / "plan_file_format.md"
+    return docs_path.read_text(encoding="utf-8")
 
+
+def _make_initial_prompt(query: WebsiteQuery) -> str:
+    docs_text = _plan_file_format_docs()
     return f"""Create a .plan file for this retrieval task.
+Output only the plan commands, one per line. No markdown fences.
 
 SITE: {query.site}
 QUERY: {query.query}
 
-Allowed commands:
-- target_site "url"
-- login_required
-- enable_text_entry
-- explore_website_openai "exploration command" max_command_steps
-- click x y
-- type "text"
-- wait ms
-- vscroll amount
-- answer_query_images "query instructions"
-- answer_query_text "query instructions"
-
-Requirements:
-1) Output only the plan commands, one per line. No markdown fences.
-2) First command must be target_site "https://{query.site}".
-3) Since this is an initial plan, DO NOT use click/type/wait/vscroll.
-4) Add login_required if likely needed.
-5) Add enable_text_entry only if text entry is likely required.
-6) Include one explore_website_openai command that describes the exploratory part.
-7) Include one answer command (answer_query_text or answer_query_images) describing the answering part with precise required data points.
-
-Hints for this query:
-- likely_login_required: {needs_login}
-- likely_text_entry_needed: {needs_text_entry}
+Plan file format documentation:
+{docs_text}
 """
 
 
 def _make_updated_prompt(query: WebsiteQuery, history: list[AttemptHistory]) -> str:
+    docs_text = _plan_file_format_docs()
     history_payload: list[dict[str, Any]] = []
     for item in history:
         history_payload.append(
@@ -354,34 +300,24 @@ def _make_updated_prompt(query: WebsiteQuery, history: list[AttemptHistory]) -> 
         )
 
     history_json = json.dumps(history_payload, indent=2)
-    return f"""Create the next .plan file for this retrieval task.
+    guidance_lines: list[str] = []
+    if any(not item.success for item in history):
+        guidance_lines.append("Try to avoid the mistakes in the previous failures.")
+    if any(item.success for item in history):
+        guidance_lines.append("Try to reduce the burden from previous successful attempts (faster, fewer steps, less user help).")
+    guidance_block = "\n".join(guidance_lines)
+    guidance_text = f"{guidance_block}\n\n" if guidance_block else ""
 
-SITE: {query.site}
+    return f"""Create the next .plan file for this retrieval task.
+Output only the plan commands, one per line. No markdown fences.
+{guidance_text}SITE: {query.site}
 QUERY: {query.query}
 
-Allowed commands:
-- target_site "url"
-- login_required
-- enable_text_entry
-- explore_website_openai "exploration command" max_command_steps
-- click x y
-- type "text"
-- wait ms
-- vscroll amount
-- answer_query_images "query instructions"
-- answer_query_text "query instructions"
+Plan file format documentation:
+{docs_text}
 
 Previous attempts (latest up to 10) with plans/results/exploration steps:
 {history_json}
-
-Requirements:
-1) Output only the plan commands, one per line. No markdown fences.
-2) First command must be target_site "https://{query.site}".
-3) Use failures to avoid repeated mistakes.
-4) If prior attempts succeeded, reduce burden where possible (fewer steps, less user help).
-5) You may replace exploration with concrete interactions when supported by successful exploration steps.
-6) If typing is needed, include enable_text_entry before any type command.
-7) End with one answer command that explicitly requests the final data points.
 """
 
 
@@ -397,10 +333,6 @@ def _host_from_url(url: str) -> str:
 
 def _default_plan(query: WebsiteQuery, history_exists: bool) -> list[PlanCommand]:
     commands: list[PlanCommand] = [PlanCommand("target_site", (f"https://{query.site}",))]
-    if _is_login_likely(query):
-        commands.append(PlanCommand("login_required"))
-    if _is_text_entry_likely(query):
-        commands.append(PlanCommand("enable_text_entry"))
     steps = 12 if history_exists else DEFAULT_EXPLORE_STEPS
     commands.append(
         PlanCommand(
@@ -430,11 +362,8 @@ def _normalize_plan(
 ) -> list[PlanCommand]:
     out: list[PlanCommand] = [PlanCommand("target_site", (f"https://{query.site}",))]
 
-    allow_manual_interactions = history_exists
     for cmd in commands:
         if cmd.name == "target_site":
-            continue
-        if not allow_manual_interactions and cmd.name in {"click", "type", "wait", "vscroll"}:
             continue
         out.append(cmd)
 
@@ -459,6 +388,7 @@ def _normalize_plan(
             "explore_website_openai",
             "click",
             "type",
+            "keypress",
             "wait",
             "vscroll",
         }:
@@ -480,12 +410,6 @@ def _normalize_plan(
     if needs_text_entry and not any(cmd.name == "enable_text_entry" for cmd in out):
         insert_at = 1
         out.insert(insert_at, PlanCommand("enable_text_entry"))
-
-    if not history_exists:
-        if _is_login_likely(query) and not any(cmd.name == "login_required" for cmd in out):
-            out.insert(1, PlanCommand("login_required"))
-        if _is_text_entry_likely(query) and not any(cmd.name == "enable_text_entry" for cmd in out):
-            out.insert(1, PlanCommand("enable_text_entry"))
 
     # Enforce target host match when model gives a conflicting host in exploratory plans.
     fixed: list[PlanCommand] = []

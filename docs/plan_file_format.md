@@ -1,41 +1,118 @@
 # Overview
-A ".plan" file sets up a plan for acquiring information from a website. The goal is to see if we are able to retrieve desired information from a website, modifying the plan as needed until we can do it successfully.
+A `.plan` file is a newline-delimited command list that drives one retrieval attempt for a single website query.
 
-# Commands
+The app parses commands from the plan, executes them in order, and writes artifacts (screenshots, HTML snapshots, and LLM logs) in the attempt's artifacts directory.
 
-## target site "url"
-This is the site we'll visit to answer the question
+# File Rules
+- One command per line.
+- Blank lines are allowed.
+- Lines starting with `#` or `//` are treated as comments.
+- Command arguments are parsed with shell-style quoting (`shlex`), so quoted strings with spaces are supported.
+- The parser accepts markdown fences if present, but plain command lines are preferred.
+- A plan must contain at least one valid command.
 
-## login_required
-This website requires a login to answer the query. The app should first check if the user is already logged in with the latest session state, otherwise display a browser page for the user to log in.
+# Command Reference
+## `target_site "url"`
+Navigates to the target URL and captures an artifact snapshot.
 
-## enable_text_entry
-Explicit command to say that text entry by the computer use agent is allowed
+Notes:
+- Exactly one argument is required.
+- In generated plans, this is always forced to `https://<query-site>`.
 
-## explore_website_openai "exploration command" max_command_steps
-Explore the website with openai computer use with the given computer use api instructions, populating the artifacts folder with information.
+## `login_required`
+Ensures login before continuing, needed for websites and/or information retrieval tasks that typically require a login.
 
-## click 920 33
-simulates mouse click at the given location, always uses the left button.
+Behavior:
+- First checks login status from a screenshot using an LLM classifier.
+- If not logged in, opens a non-headless browser, prompts the user to complete login, and waits for ENTER.
+- Returns to headless mode afterward.
+- this command is very slow
 
-## type "text to type into website"
-enters text into the website (only allowed if `enable_text_entry` is already activated)
+## `enable_text_entry`
+Enables typing for both:
+- the explicit `type` command
+- LLM-driven typing during `explore_website_openai`
 
-## wait 500
-waits the given number of miliseconds
+Without this flag, typing attempts fail.
 
-## vscroll -200
-vertically scrolls on the page: A negative number means to scroll up and reveal more info at the bottom of the page.
+## `explore_website_openai "instruction" max_command_steps`
+Runs OpenAI computer-use exploration to gather context.
 
-## answer_query_images "query instructions"
-answer the query using the 4 most recent screenshots from the website
+Arguments:
+- `instruction`: exploration objective.
+- `max_command_steps`: integer step budget.
 
-## answer_query_text "query instructions"
-answer the query use the 4 most recent page html artifacts for the site&query in the artifacts folder for this session.
+Runtime details:
+- Step budget is clamped to `1..80`.
+- Computer-use actions are mapped immediately to plan interaction commands.
+- If computer use emits an action that cannot be mapped (for example `double_click`, `drag`, `move`, or horizontal scroll), the query fails immediately with the offending action in the error text.
+- Each exploration action records artifacts and action metadata.
+- Exploration summary and step history are written to `exploration_steps.json`.
+- this command is very slow
 
-# example 1
+## `click x y`
+Left-click at integer pixel coordinates.
+
+## `type "text"`
+Types text via keyboard input.
+
+Requirement:
+- `enable_text_entry` must appear earlier in the plan.
+
+## `keypress "key1" "key2" ...`
+Presses one or more keys in sequence.
+
+Notes:
+- Keys are normalized to Playwright key names (for example `ENTER` -> `Enter`, `ctrl+l` -> `Control+L`).
+- Useful for interactions like `Enter`, `Tab`, arrow keys, and shortcuts.
+
+## `wait ms`
+Sleeps for the given integer milliseconds.
+
+## `vscroll amount`
+Vertical mouse-wheel scroll by signed integer amount.
+
+Notes:
+- Negative scrolls up.
+- Positive scrolls down.
+
+## `answer_query_text "instruction"`
+Produces final answer from the 4 most recent HTML page snapshots (`page_*.html`).
+
+Notes:
+- If no page snapshots exist yet, one is auto-captured.
+- This should usually be the final command.
+- this command is very slow
+
+## `answer_query_images "instruction"`
+Produces final answer from the 4 most recent screenshots (`screenshot_*.png`).
+
+Notes:
+- If no screenshots exist yet, one is auto-captured.
+- This should usually be the final command.
+- this command is very slow
+
+# Validation Constraints
+- Unknown commands are rejected.
+- Command argument counts/types must match the definitions above.
+- `explore_website_openai` requires an integer step count.
+- `click`, `wait`, and `vscroll` require integer arguments.
+- At least one answer command should be present (`answer_query_text` or `answer_query_images`).
+
+# Auto-Normalization for Generated Plans
+When plans are generated by the planner, they are normalized before execution.
+
+Normalization behavior:
+- Forces first command to `target_site "https://<query-site>"`.
+- Ensures at least one answer command exists; if missing, adds `answer_query_text`.
+- Moves answer commands to the end.
+- Ensures at least one pre-answer action exists; inserts `explore_website_openai` if needed.
+- Inserts `enable_text_entry` before any `type` command if missing.
+
+# Example (Valid)
 ```plan
 target_site "https://finance.yahoo.com"
-explore_website_openai "bring up information on the stock AMZN"
-answer_query "get the most recent price of AMZN"
+enable_text_entry
+explore_website_openai "Search for AMZN and open the quote page" 12
+answer_query_text "Return the latest traded price for AMZN. If uncertain, start with FAIL and explain what is missing."
 ```
