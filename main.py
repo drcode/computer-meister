@@ -5,13 +5,15 @@ import concurrent.futures
 import time
 from pathlib import Path
 
+from browse_story import run_browse_story_mode
 from execution import LockRegistry, QueryOutcome, run_query_execution, write_results_file
 from planning import create_plan_for_query
 from websites import WebsiteQuery, parse_websites_md
 
 
 def _run_single_query(query: WebsiteQuery, session_id: str, locks: LockRegistry) -> QueryOutcome:
-    query_dir = Path(query.dir_name)
+    base_dir = Path("site_data")
+    query_dir = base_dir / query.dir_name
     query_dir.mkdir(parents=True, exist_ok=True)
 
     artifacts_dir = query_dir / f"{session_id}_artifacts"
@@ -29,7 +31,7 @@ def _run_single_query(query: WebsiteQuery, session_id: str, locks: LockRegistry)
                 commands=commands,
                 artifact_dir=artifacts_dir,
                 results_path=results_path,
-                session_dir=Path(query.session_dir_name),
+                session_dir=base_dir / query.session_dir_name,
                 login_prompt_lock=locks.login_prompt_lock,
             )
         return outcome
@@ -68,6 +70,11 @@ def _enabled_queries(queries: list[WebsiteQuery]) -> list[WebsiteQuery]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Batch web retrieval tool")
+    parser.add_argument(
+        "--browse",
+        action="store_true",
+        help="Browse an existing query artifact session and render an HTML story",
+    )
     parser.add_argument("--serial", action="store_true", help="Process all queries serially")
     parser.add_argument(
         "--websites",
@@ -76,8 +83,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    session_id = str(int(time.time()))
     websites_path = Path(args.websites)
+
+    if args.browse:
+        run_browse_story_mode(websites_path=websites_path)
+        return
+
+    session_id = str(int(time.time()))
 
     queries = parse_websites_md(websites_path)
     targets = _enabled_queries(queries)

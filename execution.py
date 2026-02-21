@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import threading
 import time
 import traceback
@@ -110,6 +111,59 @@ def _artifact_index(path: Path) -> int:
     if parts and parts[-1].isdigit():
         return int(parts[-1])
     return -1
+
+
+def _redact_image_data_url(value: str) -> str | None:
+    if not value.startswith("data:image/"):
+        return None
+    if ";base64," not in value:
+        return "<redacted image data url>"
+    header, payload = value.split(",", 1)
+    mime_match = re.match(r"^data:(image/[^;]+);base64$", header, flags=re.IGNORECASE)
+    mime = mime_match.group(1) if mime_match else "image/unknown"
+    return f"<redacted image data url mime={mime} base64_chars={len(payload)}>"
+
+
+def _sanitize_for_log(value: Any, *, _seen: set[int] | None = None) -> Any:
+    if _seen is None:
+        _seen = set()
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        redacted = _redact_image_data_url(value)
+        return redacted if redacted is not None else value
+    if isinstance(value, bytes):
+        return f"<bytes len={len(value)}>"
+    if isinstance(value, Path):
+        return str(value)
+
+    marker = id(value)
+    if marker in _seen:
+        return "<cycle>"
+    _seen.add(marker)
+    try:
+        if isinstance(value, dict):
+            return {str(key): _sanitize_for_log(val, _seen=_seen) for key, val in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_sanitize_for_log(item, _seen=_seen) for item in value]
+
+        if hasattr(value, "model_dump"):
+            try:
+                return _sanitize_for_log(value.model_dump(), _seen=_seen)
+            except Exception:
+                pass
+        if hasattr(value, "__dict__"):
+            try:
+                return _sanitize_for_log(value.__dict__, _seen=_seen)
+            except Exception:
+                pass
+        return str(value)
+    finally:
+        _seen.discard(marker)
+
+
+def _dump_json(value: Any) -> str:
+    return json.dumps(_sanitize_for_log(value), ensure_ascii=False, indent=2)
 
 
 def _launch_context_kwargs(headless: bool) -> dict[str, Any]:
@@ -265,6 +319,7 @@ class PlanExecutor:
         self.headless = True
         self.help_used = False
         self.target_url = f"https://{query.site}"
+        self._llm_call_counts: dict[str, int] = {}
 
         self.openai_client = OpenAI(api_key=load_openai_api_key())
 
@@ -273,6 +328,24 @@ class PlanExecutor:
         self._page: Page | None = None
 
         self.exploration_runs: list[dict[str, Any]] = []
+
+    def _next_llm_index(self, prefix: str) -> int:
+        value = self._llm_call_counts.get(prefix, 0)
+        self._llm_call_counts[prefix] = value + 1
+        return value
+
+    def _write_llm_call_log(self, prefix: str, request: Any, response: Any, *, index: int | None = None) -> None:
+        if index is None:
+            index = self._next_llm_index(prefix)
+        payload = {
+            "llm_call": prefix,
+            "index": index,
+            "provider": "openai",
+            "request": request,
+            "response": response,
+        }
+        self.artifact_dir.mkdir(parents=True, exist_ok=True)
+        (self.artifact_dir / f"{prefix}_{index}.json").write_text(_dump_json(payload), encoding="utf-8")
 
     @property
     def page(self) -> Page:
@@ -414,22 +487,25 @@ class PlanExecutor:
             "Look for account/avatar/sign out indicators. "
             "Respond with exactly YES or NO."
         )
+        request = {
+            "model": ANSWER_MODEL,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": f"URL: {url}\n{prompt}"},
+                        {"type": "input_image", "image_url": f"data:image/png;base64,{screenshot_b64}"},
+                    ],
+                }
+            ],
+            "max_output_tokens": 12,
+        }
 
         try:
-            response = self.openai_client.responses.create(
-                model=ANSWER_MODEL,
-                input=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "input_text", "text": f"URL: {url}\n{prompt}"},
-                            {"type": "input_image", "image_url": f"data:image/png;base64,{screenshot_b64}"},
-                        ],
-                    }
-                ],
-                max_output_tokens=12,
-            )
+            response = self.openai_client.responses.create(**request)
+            self._write_llm_call_log("is_logged_in_check", request, response)
         except Exception:
+            self._write_llm_call_log("is_logged_in_check", request, "error: openai request failed")
             return False
 
         text = _responses_text(response).strip().lower()
@@ -458,10 +534,11 @@ class PlanExecutor:
             }
         ]
 
-        response = self.openai_client.responses.create(
-            model=COMPUTER_USE_MODEL,
-            tools=tools,
-            input=[
+        exploration_loop_index = self._next_llm_index("exploration_loop")
+        initial_request = {
+            "model": COMPUTER_USE_MODEL,
+            "tools": tools,
+            "input": [
                 {
                     "role": "user",
                     "content": [
@@ -470,8 +547,10 @@ class PlanExecutor:
                     ],
                 }
             ],
-            truncation="auto",
-        )
+            "truncation": "auto",
+        }
+        response = self.openai_client.responses.create(**initial_request)
+        self._write_llm_call_log("exploration_loop", initial_request, response, index=exploration_loop_index)
 
         steps_out: list[dict[str, Any]] = []
         final_text = ""
@@ -531,13 +610,29 @@ class PlanExecutor:
                     for check in safety_checks
                 ]
 
-            response = self.openai_client.responses.create(
-                model=COMPUTER_USE_MODEL,
-                tools=tools,
-                previous_response_id=response.id,
-                input=[call_output],
-                truncation="auto",
-            )
+            followup_request = {
+                "model": COMPUTER_USE_MODEL,
+                "tools": tools,
+                "previous_response_id": response.id,
+                "input": [call_output],
+                "truncation": "auto",
+            }
+            try:
+                response = self.openai_client.responses.create(**followup_request)
+                self._write_llm_call_log(
+                    "exploration_loop",
+                    followup_request,
+                    response,
+                    index=self._next_llm_index("exploration_loop"),
+                )
+            except Exception as exc:
+                self._write_llm_call_log(
+                    "exploration_loop",
+                    followup_request,
+                    f"error: {exc}",
+                    index=self._next_llm_index("exploration_loop"),
+                )
+                raise
 
         run_record = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -577,13 +672,25 @@ class PlanExecutor:
             "If the evidence is insufficient or contradictory, start with FAIL and explain what is missing.\n\n"
             + "\n\n".join(page_chunks)
         )
+        request = {
+            "model": ANSWER_MODEL,
+            "system": "Provide a concise factual answer grounded in the supplied snapshots.",
+            "max_output_tokens": 1200,
+            "temperature": 0,
+            "prompt": prompt,
+        }
 
-        response = openai(
-            prompt,
-            system="Provide a concise factual answer grounded in the supplied snapshots.",
-            max_output_tokens=1200,
-            temperature=0,
-        )
+        try:
+            response = openai(
+                prompt,
+                system="Provide a concise factual answer grounded in the supplied snapshots.",
+                max_output_tokens=1200,
+                temperature=0,
+            )
+            self._write_llm_call_log("answer_query_text", request, response)
+        except Exception:
+            self._write_llm_call_log("answer_query_text", request, "error: openai request failed")
+            raise
         return str(response).strip()
 
     async def _answer_query_images(self, instruction: str) -> str:
@@ -613,11 +720,17 @@ class PlanExecutor:
                 }
             )
 
-        response = self.openai_client.responses.create(
-            model=ANSWER_MODEL,
-            input=[{"role": "user", "content": content}],
-            max_output_tokens=1200,
-        )
+        request = {
+            "model": ANSWER_MODEL,
+            "input": [{"role": "user", "content": content}],
+            "max_output_tokens": 1200,
+        }
+        try:
+            response = self.openai_client.responses.create(**request)
+            self._write_llm_call_log("answer_query_images", request, response)
+        except Exception:
+            self._write_llm_call_log("answer_query_images", request, "error: openai request failed")
+            raise
         text = _responses_text(response).strip()
         if text:
             return text

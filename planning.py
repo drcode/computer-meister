@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from ai import gemini_fast
+from ai import GEMINI_FAST_MODEL, gemini_fast
 from websites import WebsiteQuery
 
 
@@ -37,6 +37,76 @@ def _strip_markdown_fences(text: str) -> str:
         cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\n", "", cleaned)
         cleaned = re.sub(r"\n```$", "", cleaned)
     return cleaned.strip()
+
+
+def _redact_image_data_url(value: str) -> str | None:
+    if not value.startswith("data:image/"):
+        return None
+    if ";base64," not in value:
+        return "<redacted image data url>"
+    header, payload = value.split(",", 1)
+    mime_match = re.match(r"^data:(image/[^;]+);base64$", header, flags=re.IGNORECASE)
+    mime = mime_match.group(1) if mime_match else "image/unknown"
+    return f"<redacted image data url mime={mime} base64_chars={len(payload)}>"
+
+
+def _sanitize_for_log(value: Any, *, _seen: set[int] | None = None) -> Any:
+    if _seen is None:
+        _seen = set()
+    if value is None or isinstance(value, (bool, int, float, str)):
+        if isinstance(value, str):
+            redacted = _redact_image_data_url(value)
+            return redacted if redacted is not None else value
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    marker = id(value)
+    if marker in _seen:
+        return "<cycle>"
+    _seen.add(marker)
+    try:
+        if isinstance(value, dict):
+            return {
+                str(key): _sanitize_for_log(nested, _seen=_seen)
+                for key, nested in value.items()
+            }
+        if isinstance(value, (list, tuple, set)):
+            return [_sanitize_for_log(item, _seen=_seen) for item in value]
+        if hasattr(value, "model_dump"):
+            try:
+                dumped = value.model_dump()
+                return _sanitize_for_log(dumped, _seen=_seen)
+            except Exception:
+                pass
+        if hasattr(value, "__dict__"):
+            try:
+                return _sanitize_for_log(value.__dict__, _seen=_seen)
+            except Exception:
+                pass
+        return str(value)
+    finally:
+        _seen.discard(marker)
+
+
+def _dump_json(value: Any) -> str:
+    return json.dumps(_sanitize_for_log(value), ensure_ascii=False, indent=2)
+
+
+def _write_llm_call_log(artifact_dir: Path, *, prompt: str, system: str, response: Any, error: Exception | None = None) -> None:
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {
+        "llm_call": "create_prompt",
+        "provider": "gemini_fast",
+        "model": GEMINI_FAST_MODEL,
+        "request": {
+            "system": system,
+            "prompt": prompt,
+        },
+        "response": response,
+    }
+    if error is not None:
+        payload["error"] = str(error)
+    (artifact_dir / "create_prompt.json").write_text(_dump_json(payload), encoding="utf-8")
 
 
 def parse_plan_line(line: str) -> PlanCommand:
@@ -440,18 +510,33 @@ def create_plan_for_query(query: WebsiteQuery, session_id: str, query_dir: Path)
         "Do not include markdown, explanations, or unknown commands."
     )
     prompt = _make_updated_prompt(query, history) if history else _make_initial_prompt(query)
+    artifacts_dir = query_dir / f"{session_id}_artifacts"
+    plan_error: Exception | None = None
+    response_payload: Any = None
 
     try:
-        raw_plan = gemini_fast(
-            prompt,
-            system=system,
-            temperature=0,
-            max_output_tokens=1800,
+        response_payload = str(
+            gemini_fast(
+                prompt,
+                system=system,
+                temperature=0,
+                max_output_tokens=1800,
+            )
         )
-        commands = parse_plan_text(str(raw_plan))
+        commands = parse_plan_text(response_payload)
         commands = _normalize_plan(commands, query, history_exists=bool(history))
-    except Exception:
+    except Exception as exc:  # noqa: BLE001
+        plan_error = exc
+        response_payload = f"error: {exc}"
         commands = _default_plan(query, history_exists=bool(history))
+    finally:
+        _write_llm_call_log(
+            artifacts_dir,
+            prompt=prompt,
+            system=system,
+            response=response_payload,
+            error=plan_error,
+        )
 
     plan_text = render_plan(commands)
     plan_path = query_dir / f"{session_id}.plan"
