@@ -32,6 +32,7 @@ CHROMIUM_ARGS = [
 COMPUTER_USE_MODEL = "computer-use-preview"
 ANSWER_MODEL = "gpt-5.2"
 SESSION_STORAGE_FILE = "session_storage.json"
+COOKIES_FILE = "cookies.json"
 
 
 @dataclass(frozen=True)
@@ -170,19 +171,24 @@ def _dump_json(value: Any) -> str:
 
 def _launch_context_kwargs(headless: bool) -> dict[str, Any]:
     args = list(CHROMIUM_ARGS)
+    base = {
+        "channel": "chromium",
+        "args": args,
+    }
+
     if not headless:
-        # In headed mode, control the browser window size directly for human login.
         return {
+            **base,
             "headless": False,
             "no_viewport": True,
-            "args": args + ["--window-size=1600,1000"],
+            "args": args + [f"--window-size={DISPLAY_WIDTH},{DISPLAY_HEIGHT}"],
         }
 
     return {
-        "headless": headless,
+        **base,
+        "headless": True,
         "viewport": {"width": DISPLAY_WIDTH, "height": DISPLAY_HEIGHT},
         "device_scale_factor": 1,
-        "args": args,
     }
 
 
@@ -379,6 +385,7 @@ class PlanExecutor:
 
         self.openai_client = OpenAI(api_key=load_openai_api_key())
         self.session_storage_path = self.session_dir / SESSION_STORAGE_FILE
+        self.cookies_path = self.session_dir / COOKIES_FILE
 
         self._playwright = None
         self._context: BrowserContext | None = None
@@ -441,6 +448,7 @@ class PlanExecutor:
             **_launch_context_kwargs(headless=headless),
         )
         await self._install_session_storage_init_script()
+        await self._restore_cookies()
         self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
 
     async def _close_context(self) -> None:
@@ -535,6 +543,7 @@ class PlanExecutor:
             )
             await asyncio.get_event_loop().run_in_executor(None, input)
             await self._persist_session_storage_from_context()
+            await self._persist_cookies()
         finally:
             self.login_prompt_lock.release()
             await self._close_context()
@@ -699,6 +708,30 @@ class PlanExecutor:
 
         if updated != existing:
             self._save_session_storage_snapshot(updated)
+
+    async def _persist_cookies(self) -> None:
+        """Save all cookies (including session cookies) to disk."""
+        if self._context is None:
+            return
+        try:
+            cookies = await self._context.cookies()
+            self.session_dir.mkdir(parents=True, exist_ok=True)
+            self.cookies_path.write_text(json.dumps(cookies, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    async def _restore_cookies(self) -> None:
+        """Restore previously saved cookies into the current context."""
+        if self._context is None:
+            return
+        if not self.cookies_path.exists():
+            return
+        try:
+            cookies = json.loads(self.cookies_path.read_text(encoding="utf-8"))
+            if isinstance(cookies, list) and cookies:
+                await self._context.add_cookies(cookies)
+        except Exception:
+            pass
 
     async def _run_exploration(self, instruction: str, max_steps: int) -> None:
         max_steps = max(1, min(max_steps, 80))
