@@ -1,7 +1,7 @@
 # twitter.com 0
-- disabled
-get the ten most recent notifications
+get the most recent notifications
 # weather.com 0
+- disabled
 get the temperature in Mill Valley, CA
 # finance.yahoo.com 0
 - disabled

@@ -374,6 +374,19 @@ class PlanExecutor:
 
         self.exploration_runs: list[dict[str, Any]] = []
 
+    def _print_plan_command(self, command: PlanCommand) -> None:
+        line = _plan_command_line(command)
+        print(f"[plan] {line}", flush=True)
+
+    def _print_exploration_step(
+        self,
+        *,
+        step_idx: int,
+        max_steps: int,
+        message: str,
+    ) -> None:
+        print(f"[explore step {step_idx + 1}/{max_steps}] {message}", flush=True)
+
     def _next_llm_index(self, prefix: str) -> int:
         value = self._llm_call_counts.get(prefix, 0)
         self._llm_call_counts[prefix] = value + 1
@@ -444,6 +457,7 @@ class PlanExecutor:
 
     async def _execute_command(self, command: PlanCommand) -> None:
         name = command.name
+        self._print_plan_command(command)
 
         if name == "target_site":
             self.target_url = str(command.args[0])
@@ -622,6 +636,11 @@ class PlanExecutor:
             action_type = str(computer_action.get("type", "")).strip()
             if action_type == "screenshot":
                 # Screenshot is a protocol handshake action: respond with the latest frame.
+                self._print_exploration_step(
+                    step_idx=step_idx,
+                    max_steps=max_steps,
+                    message="screenshot handshake",
+                )
                 captured = latest_view
                 screenshot_b64 = base64.b64encode(captured["screenshot_bytes"]).decode("ascii")
                 step_entry = {
@@ -632,6 +651,11 @@ class PlanExecutor:
                 }
             else:
                 plan_command = _computer_action_to_plan_command(computer_action)
+                self._print_exploration_step(
+                    step_idx=step_idx,
+                    max_steps=max_steps,
+                    message=_plan_command_line(plan_command),
+                )
                 action_error = None
                 try:
                     await _execute_plan_interaction(self.page, plan_command, allow_text_entry=self.allow_text_entry)
@@ -656,6 +680,12 @@ class PlanExecutor:
                     "error": action_error,
                     "artifact": captured["event"],
                 }
+                if action_error:
+                    self._print_exploration_step(
+                        step_idx=step_idx,
+                        max_steps=max_steps,
+                        message=f"error: {action_error}",
+                    )
             steps_out.append(step_entry)
 
             call_output: dict[str, Any] = {
