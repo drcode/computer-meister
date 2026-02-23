@@ -40,7 +40,7 @@ Runs OpenAI computer-use exploration to gather context.
 
 Arguments:
 - `instruction`: exploration objective.
-- `max_command_steps`: integer step budget.
+- `max_command_steps`: integer step budget. Note that setting a smaller budget will not improve performance, it will only increase the likelihood of failure. Just set to a value that should be plenty for the retrieval task.
 
 Runtime details:
 - Step budget is clamped to `1..80`.

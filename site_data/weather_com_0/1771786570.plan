@@ -1,0 +1,3 @@
+target_site "https://weather.com"
+explore_website_openai "Explore the site to locate the information needed to answer: get the temperature in Mill Valley, CA" 12
+answer_query_text "Answer this exactly: get the temperature in Mill Valley, CA. If uncertain, begin with FAIL and explain what is missing."

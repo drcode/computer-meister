@@ -92,10 +92,17 @@ def _dump_json(value: Any) -> str:
     return json.dumps(_sanitize_for_log(value), ensure_ascii=False, indent=2)
 
 
-def _write_llm_call_log(artifact_dir: Path, *, prompt: str, system: str, response: Any, error: Exception | None = None) -> None:
+def _write_llm_call_log(
+    artifact_dir: Path,
+    *,
+    prompt: str,
+    system: str,
+    response: Any,
+    error: Exception | None = None,
+) -> None:
     artifact_dir.mkdir(parents=True, exist_ok=True)
     payload: dict[str, Any] = {
-        "llm_call": "create_prompt",
+        "llm_call": "create_plan",
         "provider": "gemini_fast",
         "model": GEMINI_FAST_MODEL,
         "request": {
@@ -106,7 +113,7 @@ def _write_llm_call_log(artifact_dir: Path, *, prompt: str, system: str, respons
     }
     if error is not None:
         payload["error"] = str(error)
-    (artifact_dir / "create_prompt.json").write_text(_dump_json(payload), encoding="utf-8")
+    (artifact_dir / "create_plan.json").write_text(_dump_json(payload), encoding="utf-8")
 
 
 def parse_plan_line(line: str) -> PlanCommand:
@@ -227,10 +234,111 @@ def _is_success_result(results_md: str) -> bool:
     return not body.lstrip().startswith("FAIL")
 
 
-def _trim_text(text: str, max_chars: int) -> str:
-    if len(text) <= max_chars:
-        return text
-    return text[: max_chars - 32] + "\n...[truncated]..."
+def _single_line(text: str, max_chars: int) -> str:
+    collapsed = " ".join(text.split())
+    if len(collapsed) <= max_chars:
+        return collapsed
+    return collapsed[: max_chars - 3] + "..."
+
+
+def _full_plan_text(plan_text: str) -> str:
+    stripped = plan_text.strip()
+    if not stripped:
+        return "(empty plan)"
+    try:
+        return render_plan(parse_plan_text(plan_text)).strip()
+    except Exception:  # noqa: BLE001
+        return stripped
+
+
+def _render_plan_like_action(name: str, args: list[Any]) -> str | None:
+    try:
+        if name in {"login_required", "enable_text_entry"}:
+            return name
+        if name == "target_site" and len(args) == 1:
+            return render_plan([PlanCommand(name, (str(args[0]),))]).strip()
+        if name == "explore_website_openai" and len(args) >= 2:
+            instruction = str(args[0])
+            max_steps = int(args[1])
+            return render_plan([PlanCommand(name, (instruction, max_steps))]).strip()
+        if name == "click" and len(args) == 2:
+            return render_plan([PlanCommand(name, (int(args[0]), int(args[1])))]).strip()
+        if name == "type" and len(args) >= 1:
+            text = str(args[0]) if len(args) == 1 else " ".join(str(part) for part in args)
+            return render_plan([PlanCommand(name, (text,))]).strip()
+        if name == "keypress" and args:
+            keys = tuple(str(key) for key in args)
+            return render_plan([PlanCommand(name, keys)]).strip()
+        if name == "wait" and len(args) == 1:
+            return render_plan([PlanCommand(name, (int(args[0]),))]).strip()
+        if name == "vscroll" and len(args) == 1:
+            return render_plan([PlanCommand(name, (int(args[0]),))]).strip()
+        if name in {"answer_query_images", "answer_query_text"} and len(args) >= 1:
+            text = str(args[0]) if len(args) == 1 else " ".join(str(part) for part in args)
+            return render_plan([PlanCommand(name, (text,))]).strip()
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _exploration_actions_as_plan(exploration_steps_text: str | None) -> str:
+    if not exploration_steps_text:
+        return "(none)"
+
+    try:
+        payload = json.loads(exploration_steps_text)
+    except Exception:  # noqa: BLE001
+        return "(invalid exploration_steps.json)"
+
+    if not isinstance(payload, dict):
+        return "(invalid exploration_steps.json payload)"
+    runs = payload.get("runs")
+    if not isinstance(runs, list) or not runs:
+        return "(none)"
+
+    lines: list[str] = []
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+        if lines:
+            lines.append("")
+
+        steps = run.get("steps")
+        if not isinstance(steps, list) or not steps:
+            continue
+
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+
+            line: str | None = None
+            plan_command = step.get("plan_command")
+            if isinstance(plan_command, dict):
+                raw_line = plan_command.get("line")
+                if isinstance(raw_line, str) and raw_line.strip():
+                    line = raw_line.strip()
+                if line is None:
+                    action_name = str(plan_command.get("name", "")).strip()
+                    action_args = plan_command.get("args")
+                    if isinstance(action_args, list) and action_name:
+                        line = _render_plan_like_action(action_name, action_args)
+
+            if line is None:
+                computer_action = step.get("computer_action")
+                if isinstance(computer_action, dict):
+                    action_type = str(computer_action.get("type", "")).strip() or "unknown"
+                    line = f"# computer_action {action_type} (not representable as plan command)"
+
+            if line is not None:
+                lines.append(line)
+
+            error = step.get("error")
+            if error:
+                lines.append(f"# error: {_single_line(str(error), 200)}")
+
+    if not lines:
+        return "(none)"
+    return "\n".join(lines)
 
 
 def load_attempt_history(query_dir: Path) -> list[AttemptHistory]:
@@ -287,19 +395,28 @@ Plan file format documentation:
 
 def _make_updated_prompt(query: WebsiteQuery, history: list[AttemptHistory]) -> str:
     docs_text = _plan_file_format_docs()
-    history_payload: list[dict[str, Any]] = []
-    for item in history:
-        history_payload.append(
-            {
-                "session_id": item.session_id,
-                "success": item.success,
-                "plan": _trim_text(item.plan_text, 5000),
-                "results_body": _trim_text(_result_body(item.result_text), 5000),
-                "exploration_steps_json": _trim_text(item.exploration_steps_text or "", 10000),
-            }
+    history_blocks: list[str] = []
+    total_attempts = len(history)
+    for offset, item in enumerate(reversed(history)):
+        status = "success" if item.success else "fail"
+        attempt_number = total_attempts - offset
+        result_line = _single_line(_result_body(item.result_text), 220) or "(empty result)"
+        full_plan = _full_plan_text(item.plan_text)
+        exploration_actions = _exploration_actions_as_plan(item.exploration_steps_text)
+        history_blocks.append(
+            "\n".join(
+                [
+                    f"Attempt {attempt_number} [{status}]",
+                    f"Result: {result_line}",
+                    "Plan:",
+                    full_plan,
+                    "Exploration actions:",
+                    exploration_actions,
+                ]
+            )
         )
 
-    history_json = json.dumps(history_payload, indent=2)
+    history_text = "\n\n".join(history_blocks) if history_blocks else "(none)"
     guidance_lines: list[str] = []
     if any(not item.success for item in history):
         guidance_lines.append("Try to avoid the mistakes in the previous failures.")
@@ -316,8 +433,8 @@ QUERY: {query.query}
 Plan file format documentation:
 {docs_text}
 
-Previous attempts (latest up to 10) with plans/results/exploration steps:
-{history_json}
+Previous attempts (latest first):
+{history_text}
 """
 
 
@@ -434,31 +551,43 @@ def create_plan_for_query(query: WebsiteQuery, session_id: str, query_dir: Path)
         "Do not include markdown, explanations, or unknown commands."
     )
     prompt = _make_updated_prompt(query, history) if history else _make_initial_prompt(query)
+    prompt = (
+        prompt
+        + "\n\n"
+        + """Runtime strategy for create_plan:
+- Optimize for expected wall-clock runtime, not plan length; a plan with 10 cheap commands is generally better than one with a single expensive command.
+- Commands `explore_website_openai`, `login_required`, and `answer_query_*` each cost roughly 100x more wall-clock time than `click`, `type`, `keypress`, `wait`, or `vscroll`; lowering `max_command_steps` does not reduce exploration cost.
+- The "Exploration actions" listed under each previous successful attempt are already valid plan commands written in the plan syntax; they are the actual interaction sequence the explorer discovered.
+- Prefer this strategy order:
+  1. If prior successful attempts show a stable, repeatable sequence of explicit interaction commands, extract the minimal required subset and use it directly, omitting `explore_website_openai`.
+  2. If a direct URL can bypass navigation, use it.
+  3. Use `explore_website_openai` only as a last resort when no reliable interaction path is known.
+- Across multiple traces, compare click targets at similar coordinates for stability and pick the shortest successful sequence as the starting point, trimming redundant actions."""
+    )
     artifacts_dir = query_dir / f"{session_id}_artifacts"
     plan_error: Exception | None = None
     response_payload: Any = None
+    raw_plan_response: Any = None
 
     try:
-        response_payload = str(
-            gemini_fast(
-                prompt,
-                system=system,
-                temperature=0,
-                max_output_tokens=1800,
-            )
+        raw_plan_response = gemini_fast(
+            prompt,
+            system=system,
+            temperature=0,
+            max_output_tokens=1800,
         )
+        response_payload = str(raw_plan_response)
         commands = parse_plan_text(response_payload)
         commands = _normalize_plan(commands, query, history_exists=bool(history))
     except Exception as exc:  # noqa: BLE001
         plan_error = exc
-        response_payload = f"error: {exc}"
         commands = _default_plan(query, history_exists=bool(history))
     finally:
         _write_llm_call_log(
             artifacts_dir,
             prompt=prompt,
             system=system,
-            response=response_payload,
+            response=raw_plan_response,
             error=plan_error,
         )
 

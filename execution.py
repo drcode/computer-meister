@@ -379,7 +379,15 @@ class PlanExecutor:
         self._llm_call_counts[prefix] = value + 1
         return value
 
-    def _write_llm_call_log(self, prefix: str, request: Any, response: Any, *, index: int | None = None) -> None:
+    def _write_llm_call_log(
+        self,
+        prefix: str,
+        request: Any,
+        response: Any,
+        *,
+        index: int | None = None,
+        error: Exception | None = None,
+    ) -> None:
         if index is None:
             index = self._next_llm_index(prefix)
         payload = {
@@ -389,6 +397,8 @@ class PlanExecutor:
             "request": request,
             "response": response,
         }
+        if error is not None:
+            payload["error"] = str(error)
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         (self.artifact_dir / f"{prefix}_{index}.json").write_text(_dump_json(payload), encoding="utf-8")
 
@@ -529,8 +539,8 @@ class PlanExecutor:
         try:
             response = self.openai_client.responses.create(**request)
             self._write_llm_call_log("is_logged_in_check", request, response)
-        except Exception:
-            self._write_llm_call_log("is_logged_in_check", request, "error: openai request failed")
+        except Exception as exc:  # noqa: BLE001
+            self._write_llm_call_log("is_logged_in_check", request, None, error=exc)
             return False
 
         text = _responses_text(response).strip().lower()
@@ -575,8 +585,18 @@ class PlanExecutor:
             ],
             "truncation": "auto",
         }
-        response = self.openai_client.responses.create(**initial_request)
-        self._write_llm_call_log("exploration_loop", initial_request, response, index=exploration_loop_index)
+        try:
+            response = self.openai_client.responses.create(**initial_request)
+            self._write_llm_call_log("exploration_loop", initial_request, response, index=exploration_loop_index)
+        except Exception as exc:  # noqa: BLE001
+            self._write_llm_call_log(
+                "exploration_loop",
+                initial_request,
+                None,
+                index=exploration_loop_index,
+                error=exc,
+            )
+            raise
 
         steps_out: list[dict[str, Any]] = []
         final_text = ""
@@ -669,12 +689,13 @@ class PlanExecutor:
                     response,
                     index=self._next_llm_index("exploration_loop"),
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 self._write_llm_call_log(
                     "exploration_loop",
                     followup_request,
-                    f"error: {exc}",
+                    None,
                     index=self._next_llm_index("exploration_loop"),
+                    error=exc,
                 )
                 raise
 
@@ -732,8 +753,8 @@ class PlanExecutor:
                 temperature=0,
             )
             self._write_llm_call_log("answer_query_text", request, response)
-        except Exception:
-            self._write_llm_call_log("answer_query_text", request, "error: openai request failed")
+        except Exception as exc:  # noqa: BLE001
+            self._write_llm_call_log("answer_query_text", request, None, error=exc)
             raise
         return str(response).strip()
 
@@ -772,8 +793,8 @@ class PlanExecutor:
         try:
             response = self.openai_client.responses.create(**request)
             self._write_llm_call_log("answer_query_images", request, response)
-        except Exception:
-            self._write_llm_call_log("answer_query_images", request, "error: openai request failed")
+        except Exception as exc:  # noqa: BLE001
+            self._write_llm_call_log("answer_query_images", request, None, error=exc)
             raise
         text = _responses_text(response).strip()
         if text:

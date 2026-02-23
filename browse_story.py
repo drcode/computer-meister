@@ -15,7 +15,7 @@ from websites import WebsiteQuery, parse_websites_md
 
 
 LLM_ORDER = {
-    "create_prompt": 0,
+    "create_plan": 0,
     "is_logged_in_check": 1,
     "exploration_loop": 2,
     "answer_query_text": 3,
@@ -565,14 +565,34 @@ def _render_screenshot_gallery(runs: list[dict[str, Any]], artifacts_dir: Path, 
             step_idx = step.get("step")
             notes[screenshot_name] = f"run {run_index}, step {step_idx}, action {action_type}".strip()
 
-    items: list[str] = ['<div class="gallery">']
-    for screenshot in screenshots:
+    items: list[str] = ['<div class="gallery-shell">']
+    items.append('<div id="screenshot-gallery" class="gallery" role="list" aria-label="Screenshots">')
+    for index, screenshot in enumerate(screenshots):
         rel = _relative_path(output_file, screenshot)
         caption = notes.get(screenshot.name, screenshot.name)
-        items.append('<figure class="card">')
-        items.append(f'<a href="{html.escape(rel)}"><img src="{html.escape(rel)}" loading="lazy" /></a>')
-        items.append(f"<figcaption>{html.escape(caption)}</figcaption>")
-        items.append("</figure>")
+        safe_rel = html.escape(rel, quote=True)
+        safe_caption = html.escape(caption, quote=True)
+        items.append(f'<button type="button" class="card gallery-thumb" role="listitem" data-index="{index}" data-src="{safe_rel}" data-caption="{safe_caption}">')
+        items.append(f'<img src="{safe_rel}" alt="{safe_caption}" loading="lazy" />')
+        items.append(f"<span>{safe_caption}</span>")
+        items.append("</button>")
+    items.append("</div>")
+    items.extend(
+        [
+            '<div id="screenshot-viewer" class="gallery-viewer" aria-live="polite" hidden>',
+            '  <div class="viewer-top">',
+            '    <span id="screenshot-viewer-index" class="viewer-meta"></span>',
+            '    <button id="screenshot-viewer-close" type="button">Close</button>',
+            "  </div>",
+            '  <div class="viewer-frame">',
+            '    <button id="screenshot-viewer-prev" type="button" class="viewer-control">Prev</button>',
+            '    <img id="screenshot-viewer-image" src="" alt="Selected screenshot" />',
+            '    <button id="screenshot-viewer-next" type="button" class="viewer-control">Next</button>',
+            "  </div>",
+            '  <p id="screenshot-viewer-caption" class="viewer-caption"></p>',
+            "</div>",
+        ]
+    )
     items.append("</div>")
     return "\n".join(items)
 
@@ -583,8 +603,8 @@ def _build_story_html(history: QueryHistory, instance: SessionInstance, output_f
     llm_logs = _load_llm_logs(instance.artifacts_dir)
     runs = _load_exploration_runs(instance.artifacts_dir)
 
-    create_logs = [log for log in llm_logs if log.name == "create_prompt"]
-    non_create_logs = [log for log in llm_logs if log.name != "create_prompt"]
+    create_logs = [log for log in llm_logs if log.name == "create_plan"]
+    non_create_logs = [log for log in llm_logs if log.name != "create_plan"]
 
     meta_lines: list[str] = []
     for key in ("time", "headless", "help"):
@@ -619,6 +639,18 @@ def _build_story_html(history: QueryHistory, instance: SessionInstance, output_f
         "    .gallery { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }",
         "    figure { margin: 0; }",
         "    figcaption { margin-top: 8px; color: var(--muted); font-size: 0.9rem; }",
+        "    .gallery-shell { display: grid; gap: 12px; }",
+        "    .gallery-thumb { text-align: left; border: 1px solid var(--border); border-radius: 10px; padding: 8px; background: #f9fbff; color: inherit; cursor: pointer; }",
+        "    .gallery-thumb:hover, .gallery-thumb:focus-visible { border-color: var(--accent); outline: none; }",
+        "    .gallery-thumb span { display: block; margin-top: 6px; color: var(--muted); font-size: 0.9rem; }",
+        "    .gallery-viewer { border: 1px solid var(--border); border-radius: 12px; background: #ffffff; padding: 12px; box-shadow: 0 8px 20px rgba(12, 22, 42, 0.1); }",
+        "    .gallery-viewer[hidden] { display: none; }",
+        "    .viewer-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }",
+        "    .viewer-frame { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 8px; }",
+        "    .viewer-control { background: #eef3fc; color: var(--text); border: 1px solid var(--border); border-radius: 999px; min-width: 70px; padding: 10px 12px; font-weight: 600; }",
+        "    .viewer-control:hover, .viewer-control:focus-visible { background: #e2ecff; outline: none; }",
+        "    .viewer-caption { margin: 8px 0 0; color: var(--muted); }",
+        "    .viewer-meta { color: var(--muted); font-size: 0.9rem; }",
         "  </style>",
         "</head>",
         "<body>",
@@ -659,7 +691,7 @@ def _build_story_html(history: QueryHistory, instance: SessionInstance, output_f
         for log in create_logs:
             parts.append(_render_llm_entry(log))
     else:
-        parts.append('<p class="muted">No create_prompt log found.</p>')
+        parts.append('<p class="muted">No create_plan log found.</p>')
 
     parts.extend(
         [
@@ -687,6 +719,79 @@ def _build_story_html(history: QueryHistory, instance: SessionInstance, output_f
             _render_screenshot_gallery(runs, instance.artifacts_dir, output_file),
             "</section>",
             "</main>",
+            "<script>",
+            "  const gallery = document.querySelector('#screenshot-gallery');",
+            "  const thumbs = gallery ? Array.from(gallery.querySelectorAll('.gallery-thumb')) : [];",
+            "  const viewer = document.getElementById('screenshot-viewer');",
+            "  const viewerImage = document.getElementById('screenshot-viewer-image');",
+            "  const viewerCaption = document.getElementById('screenshot-viewer-caption');",
+            "  const viewerIndex = document.getElementById('screenshot-viewer-index');",
+            "  const prevButton = document.getElementById('screenshot-viewer-prev');",
+            "  const nextButton = document.getElementById('screenshot-viewer-next');",
+            "  const closeButton = document.getElementById('screenshot-viewer-close');",
+            "  let currentIndex = 0;",
+            "",
+            "  function openViewer(index) {",
+            "    if (!viewer || !thumbs.length) {",
+            "      return;",
+            "    }",
+            "    currentIndex = ((index % thumbs.length) + thumbs.length) % thumbs.length;",
+            "    const thumb = thumbs[currentIndex];",
+            "    const src = thumb.dataset.src || '';",
+            "    const caption = thumb.dataset.caption || '';",
+            "    viewerImage.src = src;",
+            "    viewerImage.alt = caption || `Screenshot ${currentIndex + 1}`;",
+            "    viewerCaption.textContent = caption || `Screenshot ${currentIndex + 1}`;",
+            "    viewerIndex.textContent = `${currentIndex + 1} / ${thumbs.length}`;",
+            "    viewer.hidden = false;",
+            "  }",
+            "",
+            "  function move(delta) {",
+            "    if (!viewer || viewer.hidden) {",
+            "      return;",
+            "    }",
+            "    openViewer(currentIndex + delta);",
+            "  }",
+            "",
+            "  function closeViewer() {",
+            "    if (!viewer) {",
+            "      return;",
+            "    }",
+            "    viewer.hidden = true;",
+            "  }",
+            "",
+            "  thumbs.forEach((thumb, index) => {",
+            "    thumb.addEventListener('click', () => openViewer(index));",
+            "  });",
+            "",
+            "  if (prevButton) {",
+            "    prevButton.addEventListener('click', () => move(-1));",
+            "  }",
+            "  if (nextButton) {",
+            "    nextButton.addEventListener('click', () => move(1));",
+            "  }",
+            "  if (closeButton) {",
+            "    closeButton.addEventListener('click', closeViewer);",
+            "  }",
+            "",
+            "  window.addEventListener('keydown', (event) => {",
+            "    if (!viewer || viewer.hidden) {",
+            "      return;",
+            "    }",
+            "    if (event.key === 'Escape') {",
+            "      closeViewer();",
+            "      return;",
+            "    }",
+            "    if (event.key === 'ArrowRight' || event.key === 'ArrowLeft' || event.key.toLowerCase() === 'n') {",
+            "      event.preventDefault();",
+            "      if (event.key === 'ArrowLeft') {",
+            "        move(-1);",
+            "      } else {",
+            "        move(1);",
+            "      }",
+            "    }",
+            "  });",
+            "</script>",
             "</body>",
             "</html>",
         ]
