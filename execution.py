@@ -78,8 +78,42 @@ class ArtifactRecorder:
         html_path = self.artifact_dir / html_name
 
         screenshot_bytes = await page.screenshot(path=str(screenshot_path))
-        html = await page.content()
-        html_path.write_text(html, encoding="utf-8")
+        main_html = await page.content()
+        combined_html = main_html
+
+        # Some sites render critical data inside iframes (e.g., portfolio grids).
+        # Include per-frame DOM snapshots so downstream parsing can see that content.
+        frame_sections: list[str] = []
+        for frame_index, frame in enumerate(page.frames):
+            if frame == page.main_frame:
+                continue
+            try:
+                frame_html = await frame.content()
+            except Exception:
+                continue
+            if not frame_html.strip():
+                continue
+            frame_name = frame.name or "(unnamed)"
+            frame_url = frame.url or "(no url)"
+            frame_sections.append(
+                "\n".join(
+                    [
+                        f"<!-- BEGIN FRAME {frame_index}: {frame_name} | {frame_url} -->",
+                        frame_html,
+                        f"<!-- END FRAME {frame_index} -->",
+                    ]
+                )
+            )
+
+        if frame_sections:
+            combined_html = (
+                f"{main_html}\n\n"
+                "<!-- BEGIN EMBEDDED FRAME SNAPSHOTS -->\n"
+                f"{chr(10).join(frame_sections)}\n"
+                "<!-- END EMBEDDED FRAME SNAPSHOTS -->\n"
+            )
+
+        html_path.write_text(combined_html, encoding="utf-8")
 
         event = {
             "index": idx,
