@@ -1,5 +1,6 @@
 # twitter.com 0
-get the most recent notifications
+- disabled
+get the list of the most recent notifications
 # weather.com 0
 - disabled
 get the temperature in Mill Valley, CA
@@ -7,5 +8,4 @@ get the temperature in Mill Valley, CA
 - disabled
 find the most recent price of AMZN
 # etrade.com 0
-- disabled
-find the amount of stock holdings in the "Conrad" portfolio, also the cash balance for the account.
+find the stock holdings in the "Conrad" portfolio, also the cash balance for the account.

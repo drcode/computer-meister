@@ -1,0 +1,6 @@
+target_site "https://twitter.com"
+login_required
+wait 2000
+keypress g n
+wait 3000
+answer_query_text "List the most recent notifications."

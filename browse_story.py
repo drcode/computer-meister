@@ -51,6 +51,7 @@ class LlmLogEntry:
     model: str | None
     request: Any
     response: Any
+    error: str | None
 
 
 def _session_sort_key(session_id: str) -> tuple[int, int | str]:
@@ -347,6 +348,7 @@ def _load_llm_logs(artifacts_dir: Path) -> list[LlmLogEntry]:
                     model=None,
                     request=None,
                     response=f"Invalid JSON payload in {path.name}",
+                    error=None,
                 )
             )
             continue
@@ -357,6 +359,7 @@ def _load_llm_logs(artifacts_dir: Path) -> list[LlmLogEntry]:
         model = payload.get("model") if isinstance(payload.get("model"), str) else None
         request = payload.get("request")
         response = payload.get("response")
+        error = payload.get("error") if isinstance(payload.get("error"), str) else None
 
         if model is None and isinstance(request, dict) and isinstance(request.get("model"), str):
             model = request.get("model")
@@ -370,6 +373,7 @@ def _load_llm_logs(artifacts_dir: Path) -> list[LlmLogEntry]:
                 model=model,
                 request=request,
                 response=response,
+                error=error,
             )
         )
 
@@ -404,6 +408,9 @@ def _load_exploration_runs(artifacts_dir: Path) -> list[dict[str, Any]]:
 
 
 def _response_summary(log: LlmLogEntry) -> str | None:
+    if log.error:
+        return f"ERROR: {log.error.splitlines()[0][:280]}"
+
     if isinstance(log.response, str):
         text = log.response.strip()
         if text:
@@ -418,7 +425,53 @@ def _response_summary(log: LlmLogEntry) -> str | None:
     return None
 
 
-def _render_llm_entry(log: LlmLogEntry) -> str:
+def _request_image_artifacts(log: LlmLogEntry) -> list[str]:
+    request = log.request if isinstance(log.request, dict) else None
+    if request is None:
+        return []
+
+    names: list[str] = []
+    single = request.get("input_image_artifact")
+    if isinstance(single, str) and single.strip():
+        names.append(single.strip())
+
+    multiple = request.get("input_image_artifacts")
+    if isinstance(multiple, list):
+        for item in multiple:
+            if isinstance(item, str) and item.strip():
+                names.append(item.strip())
+
+    return names
+
+
+def _request_inline_image_descriptions(log: LlmLogEntry) -> list[str]:
+    request = log.request if isinstance(log.request, dict) else None
+    if request is None:
+        return []
+
+    input_items = request.get("input")
+    if not isinstance(input_items, list):
+        return []
+
+    out: list[str] = []
+    for item in input_items:
+        if not isinstance(item, dict):
+            continue
+        content_items = item.get("content")
+        if not isinstance(content_items, list):
+            continue
+        for content in content_items:
+            if not isinstance(content, dict):
+                continue
+            if str(content.get("type", "")) != "input_image":
+                continue
+            image_url = content.get("image_url")
+            if isinstance(image_url, str) and image_url.strip():
+                out.append(image_url.strip())
+    return out
+
+
+def _render_llm_entry(log: LlmLogEntry, *, artifacts_dir: Path, output_file: Path) -> str:
     title = log.name if log.index is None else f"{log.name} #{log.index}"
     source_line = f"{log.provider or 'unknown provider'}"
     if log.model:
@@ -434,6 +487,25 @@ def _render_llm_entry(log: LlmLogEntry) -> str:
     if summary:
         parts.append(f"<p><strong>Response summary:</strong> {html.escape(summary)}</p>")
 
+    image_names = _request_image_artifacts(log)
+    inline_images = _request_inline_image_descriptions(log)
+    if image_names or inline_images:
+        parts.append("<p><strong>Input images:</strong></p>")
+        for image_name in image_names:
+            image_path = artifacts_dir / image_name
+            if not image_path.exists():
+                parts.append(f"<p class=\"meta\">missing image artifact: {html.escape(image_name)}</p>")
+                continue
+            rel = _relative_path(output_file, image_path)
+            safe_rel = html.escape(rel, quote=True)
+            safe_name = html.escape(image_name)
+            parts.append(f"<p class=\"meta\">{safe_name}</p>")
+            parts.append(f'<a href="{safe_rel}"><img src="{safe_rel}" loading="lazy" /></a>')
+        if inline_images:
+            parts.append("<details><summary>Input image payloads</summary>")
+            parts.append(_html_pre(inline_images))
+            parts.append("</details>")
+
     if log.request is not None:
         request_obj: Any = log.request
         if isinstance(log.request, dict) and "prompt" in log.request:
@@ -446,6 +518,11 @@ def _render_llm_entry(log: LlmLogEntry) -> str:
 
         parts.append("<details><summary>Request</summary>")
         parts.append(_html_pre(request_obj))
+        parts.append("</details>")
+
+    if log.error:
+        parts.append("<details><summary>Error</summary>")
+        parts.append(_html_pre(log.error))
         parts.append("</details>")
 
     if log.response is not None:
@@ -689,7 +766,7 @@ def _build_story_html(history: QueryHistory, instance: SessionInstance, output_f
 
     if create_logs:
         for log in create_logs:
-            parts.append(_render_llm_entry(log))
+            parts.append(_render_llm_entry(log, artifacts_dir=instance.artifacts_dir, output_file=output_file))
     else:
         parts.append('<p class="muted">No create_plan log found.</p>')
 
@@ -707,7 +784,7 @@ def _build_story_html(history: QueryHistory, instance: SessionInstance, output_f
 
     if non_create_logs:
         for log in non_create_logs:
-            parts.append(_render_llm_entry(log))
+            parts.append(_render_llm_entry(log, artifacts_dir=instance.artifacts_dir, output_file=output_file))
     else:
         parts.append('<p class="muted">No additional LLM logs found.</p>')
 

@@ -7,6 +7,7 @@ import re
 import threading
 import time
 import traceback
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +31,7 @@ CHROMIUM_ARGS = [
 ]
 COMPUTER_USE_MODEL = "computer-use-preview"
 ANSWER_MODEL = "gpt-5.2"
+SESSION_STORAGE_FILE = "session_storage.json"
 
 
 @dataclass(frozen=True)
@@ -167,11 +169,20 @@ def _dump_json(value: Any) -> str:
 
 
 def _launch_context_kwargs(headless: bool) -> dict[str, Any]:
+    args = list(CHROMIUM_ARGS)
+    if not headless:
+        # In headed mode, control the browser window size directly for human login.
+        return {
+            "headless": False,
+            "no_viewport": True,
+            "args": args + ["--window-size=1600,1000"],
+        }
+
     return {
         "headless": headless,
         "viewport": {"width": DISPLAY_WIDTH, "height": DISPLAY_HEIGHT},
         "device_scale_factor": 1,
-        "args": CHROMIUM_ARGS,
+        "args": args,
     }
 
 
@@ -367,6 +378,7 @@ class PlanExecutor:
         self._llm_call_counts: dict[str, int] = {}
 
         self.openai_client = OpenAI(api_key=load_openai_api_key())
+        self.session_storage_path = self.session_dir / SESSION_STORAGE_FILE
 
         self._playwright = None
         self._context: BrowserContext | None = None
@@ -428,6 +440,7 @@ class PlanExecutor:
             str(self.session_dir),
             **_launch_context_kwargs(headless=headless),
         )
+        await self._install_session_storage_init_script()
         self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
 
     async def _close_context(self) -> None:
@@ -521,6 +534,7 @@ class PlanExecutor:
                 flush=True,
             )
             await asyncio.get_event_loop().run_in_executor(None, input)
+            await self._persist_session_storage_from_context()
         finally:
             self.login_prompt_lock.release()
             await self._close_context()
@@ -529,14 +543,37 @@ class PlanExecutor:
         await _safe_goto(self.page, self.target_url)
 
     async def _is_logged_in_page(self, page: Page, url: str) -> bool:
-        screenshot = await page.screenshot()
+        # Give dynamic sites a short window to render before we classify login state.
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:
+            pass
+        try:
+            await page.wait_for_load_state("networkidle", timeout=5000)
+        except Exception:
+            pass
+
+        screenshot = b""
+        html = ""
+        for _ in range(3):
+            await page.wait_for_timeout(700)
+            screenshot = await page.screenshot()
+            html = await page.content()
+            # Heuristic to avoid classifying obviously blank/early frames.
+            if len(screenshot) >= 5000 and len(html.strip()) >= 300:
+                break
+
+        log_index = self._next_llm_index("is_logged_in_check")
+        input_image_name = f"is_logged_in_check_input_{log_index}.png"
+        input_image_path = self.artifact_dir / input_image_name
+        input_image_path.write_bytes(screenshot)
         screenshot_b64 = base64.b64encode(screenshot).decode("ascii")
         prompt = (
             "Is the user already logged in on this webpage? "
             "Look for account/avatar/sign out indicators. "
             "Respond with exactly YES or NO."
         )
-        request = {
+        api_request = {
             "model": ANSWER_MODEL,
             "input": [
                 {
@@ -547,18 +584,121 @@ class PlanExecutor:
                     ],
                 }
             ],
-            "max_output_tokens": 12,
+            "max_output_tokens": 16,
         }
+        log_request = dict(api_request)
+        log_request["input_image_artifact"] = input_image_name
 
         try:
-            response = self.openai_client.responses.create(**request)
-            self._write_llm_call_log("is_logged_in_check", request, response)
+            response = self.openai_client.responses.create(**api_request)
+            self._write_llm_call_log("is_logged_in_check", log_request, response, index=log_index)
         except Exception as exc:  # noqa: BLE001
-            self._write_llm_call_log("is_logged_in_check", request, None, error=exc)
+            self._write_llm_call_log("is_logged_in_check", log_request, None, index=log_index, error=exc)
             return False
 
         text = _responses_text(response).strip().lower()
         return text.startswith("yes")
+
+    def _load_session_storage_snapshot(self) -> dict[str, dict[str, str]]:
+        if not self.session_storage_path.exists():
+            return {}
+        try:
+            payload = json.loads(self.session_storage_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+
+        cleaned: dict[str, dict[str, str]] = {}
+        for origin, items in payload.items():
+            if not isinstance(origin, str) or not isinstance(items, dict):
+                continue
+            normalized: dict[str, str] = {}
+            for key, value in items.items():
+                if not isinstance(key, str):
+                    continue
+                if value is None:
+                    normalized[key] = ""
+                elif isinstance(value, str):
+                    normalized[key] = value
+                else:
+                    normalized[key] = str(value)
+            if normalized:
+                cleaned[origin] = normalized
+        return cleaned
+
+    def _save_session_storage_snapshot(self, snapshot: dict[str, dict[str, str]]) -> None:
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        self.session_storage_path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+
+    async def _install_session_storage_init_script(self) -> None:
+        if self._context is None:
+            return
+        snapshot = self._load_session_storage_snapshot()
+        if not snapshot:
+            return
+        serialized = json.dumps(snapshot)
+        script = (
+            "(() => {"
+            f"const persisted = {serialized};"
+            "try {"
+            "  const origin = window.location.origin;"
+            "  const entries = persisted[origin];"
+            "  if (!entries || typeof entries !== 'object') return;"
+            "  for (const [k, v] of Object.entries(entries)) {"
+            "    try { sessionStorage.setItem(k, String(v)); } catch (_) {}"
+            "  }"
+            "} catch (_) {}"
+            "})();"
+        )
+        await self._context.add_init_script(script=script)
+
+    async def _persist_session_storage_from_context(self) -> None:
+        if self._context is None:
+            return
+
+        existing = self._load_session_storage_snapshot()
+        updated: dict[str, dict[str, str]] = dict(existing)
+
+        for page in self._context.pages:
+            raw_url = (page.url or "").strip()
+            parsed = urlparse(raw_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                continue
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            try:
+                values = await page.evaluate(
+                    """() => {
+                        const out = {};
+                        for (let i = 0; i < sessionStorage.length; i += 1) {
+                            const key = sessionStorage.key(i);
+                            if (key === null) continue;
+                            const value = sessionStorage.getItem(key);
+                            out[key] = value === null ? "" : value;
+                        }
+                        return out;
+                    }"""
+                )
+            except Exception:
+                continue
+
+            if not isinstance(values, dict):
+                continue
+            cleaned: dict[str, str] = {}
+            for key, value in values.items():
+                if not isinstance(key, str):
+                    continue
+                if value is None:
+                    cleaned[key] = ""
+                elif isinstance(value, str):
+                    cleaned[key] = value
+                else:
+                    cleaned[key] = str(value)
+            if cleaned:
+                updated[origin] = cleaned
+
+        if updated != existing:
+            self._save_session_storage_snapshot(updated)
 
     async def _run_exploration(self, instruction: str, max_steps: int) -> None:
         max_steps = max(1, min(max_steps, 80))
