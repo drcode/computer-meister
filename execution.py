@@ -24,11 +24,7 @@ from websites import WebsiteQuery
 
 DISPLAY_WIDTH = 2048
 DISPLAY_HEIGHT = 1600
-CHROMIUM_ARGS = [
-    "--disable-blink-features=AutomationControlled",
-    "--disable-http2",
-    "--disable-quic",
-]
+BROWSER_ARGS: list[str] = []
 COMPUTER_USE_MODEL = "computer-use-preview"
 ANSWER_MODEL = "gpt-5.2"
 SESSION_STORAGE_FILE = "session_storage.json"
@@ -201,11 +197,8 @@ def _dump_json(value: Any) -> str:
 
 
 def _launch_context_kwargs(headless: bool) -> dict[str, Any]:
-    args = list(CHROMIUM_ARGS)
-    base = {
-        "channel": "chromium",
-        "args": args,
-    }
+    args = list(BROWSER_ARGS)
+    base = {"args": args}
 
     if not headless:
         return {
@@ -537,7 +530,7 @@ class PlanExecutor:
     async def _launch_context(self, *, headless: bool) -> None:
         if self._playwright is None:
             self._playwright = await async_playwright().start()
-        self._context = await self._playwright.chromium.launch_persistent_context(
+        self._context = await self._playwright.firefox.launch_persistent_context(
             str(self.session_dir),
             **_launch_context_kwargs(headless=headless),
         )

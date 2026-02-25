@@ -1,0 +1,13 @@
+target_site "https://fidelity.com"
+login_required
+enable_text_entry
+wait 2000
+click 167 78
+wait 1000
+click 128 153
+wait 4000
+click 179 443
+wait 2000
+click 564 301
+wait 2000
+answer_query_text "List the stock holdings (symbol and quantity) and the cash or margin balance for the 'Joint WROS' portfolio. If the account name is slightly different, use the one that best matches 'Joint WROS'."

@@ -1,0 +1,5 @@
+target_site "https://fidelity.com"
+login_required
+enable_text_entry
+explore_website_openai "Navigate to the Portfolio Summary page using the 'Accounts & Trade' menu. Locate the account named 'Joint WROS' and click on it. Open the 'Positions' tab for this account. Ensure that all stock holdings (symbols and quantities) and the cash or margin balance are visible on the screen. Scroll down if necessary to capture all data." 80
+answer_query_text "List the stock holdings (symbol and quantity) and the cash or margin balance for the 'Joint WROS' portfolio. If the account name is slightly different, use the one that best matches 'Joint WROS'."
