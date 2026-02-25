@@ -19,12 +19,17 @@ from playwright.async_api import BrowserContext, Page, TimeoutError as Playwrigh
 from ai import load_openai_api_key, openai
 from html_preprocessor import preprocess_html
 from planning import PlanCommand, render_plan
-from websites import WebsiteQuery
+from websites import CHROMIUM_BROWSER, DEFAULT_BROWSER, WebsiteQuery
 
 
 DISPLAY_WIDTH = 2048
 DISPLAY_HEIGHT = 1600
-BROWSER_ARGS: list[str] = []
+FIREFOX_ARGS: list[str] = []
+CHROMIUM_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-http2",
+    "--disable-quic",
+]
 COMPUTER_USE_MODEL = "computer-use-preview"
 ANSWER_MODEL = "gpt-5.2"
 SESSION_STORAGE_FILE = "session_storage.json"
@@ -201,8 +206,33 @@ def _dump_json(value: Any) -> str:
     return json.dumps(_sanitize_for_log(value), ensure_ascii=False, indent=2)
 
 
-def _launch_context_kwargs(headless: bool) -> dict[str, Any]:
-    args = list(BROWSER_ARGS)
+def _launch_context_kwargs(*, browser: str, headless: bool) -> dict[str, Any]:
+    if browser == CHROMIUM_BROWSER:
+        args = list(CHROMIUM_ARGS)
+        base = {
+            "channel": CHROMIUM_BROWSER,
+            "args": args,
+        }
+
+        if not headless:
+            return {
+                **base,
+                "headless": False,
+                "no_viewport": True,
+                "args": args + [f"--window-size={DISPLAY_WIDTH},{DISPLAY_HEIGHT}"],
+            }
+
+        return {
+            **base,
+            "headless": True,
+            "viewport": {"width": DISPLAY_WIDTH, "height": DISPLAY_HEIGHT},
+            "device_scale_factor": 1,
+        }
+
+    if browser != DEFAULT_BROWSER:
+        raise ValueError(f"Unsupported browser '{browser}'")
+
+    args = list(FIREFOX_ARGS)
     base = {"args": args, "user_agent": FIREFOX_USER_AGENT}
 
     if not headless:
@@ -538,13 +568,22 @@ class PlanExecutor:
     async def _launch_context(self, *, headless: bool) -> None:
         if self._playwright is None:
             self._playwright = await async_playwright().start()
-        self._context = await self._playwright.firefox.launch_persistent_context(
-            str(self.session_dir),
-            **_launch_context_kwargs(headless=headless),
-        )
-        if not headless:
-            await self._install_human_login_stealth_init_script()
-        await self._install_session_storage_init_script()
+        launch_kwargs = _launch_context_kwargs(browser=self.query.browser, headless=headless)
+        if self.query.browser == CHROMIUM_BROWSER:
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                str(self.session_dir),
+                **launch_kwargs,
+            )
+        else:
+            self._context = await self._playwright.firefox.launch_persistent_context(
+                str(self.session_dir),
+                **launch_kwargs,
+            )
+        human_login_injection_disabled = bool(self.query.nofill and not headless)
+        if not human_login_injection_disabled:
+            if not headless:
+                await self._install_human_login_stealth_init_script()
+            await self._install_session_storage_init_script()
         await self._restore_cookies()
         self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
 
@@ -632,8 +671,9 @@ class PlanExecutor:
             self.headless = False
             self.help_used = True
             await self._launch_context(headless=False)
-            await self._install_login_form_prefill_init_script()
-            await self._install_login_field_capture()
+            if not self.query.nofill:
+                await self._install_login_form_prefill_init_script()
+                await self._install_login_field_capture()
             await _safe_goto(self.page, self.target_url)
             print(
                 f"\nLogin required for {self.query.section_id}. "
@@ -642,7 +682,8 @@ class PlanExecutor:
             )
             await asyncio.get_event_loop().run_in_executor(None, input)
             await self.page.wait_for_timeout(300)
-            self._persist_login_form_memory()
+            if not self.query.nofill:
+                self._persist_login_form_memory()
             await self._persist_session_storage_from_context()
             await self._persist_cookies()
         finally:

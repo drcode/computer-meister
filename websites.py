@@ -7,6 +7,8 @@ from pathlib import Path
 
 HEADER_RE = re.compile(r"^#\s+([^\s]+)\s+(\d+)\s*$")
 COMMENT_RE = re.compile(r"^<!--.*-->$")
+DEFAULT_BROWSER = "firefox"
+CHROMIUM_BROWSER = "chromium"
 
 
 @dataclass(frozen=True)
@@ -15,6 +17,8 @@ class WebsiteQuery:
     number: int
     query: str
     disabled: bool = False
+    browser: str = DEFAULT_BROWSER
+    nofill: bool = False
 
     @property
     def section_id(self) -> str:
@@ -26,7 +30,10 @@ class WebsiteQuery:
 
     @property
     def session_dir_name(self) -> str:
-        return f"{sanitize_name(self.site)}_session"
+        site_name = sanitize_name(self.site)
+        if self.browser == DEFAULT_BROWSER:
+            return f"{site_name}_session"
+        return f"{site_name}_{sanitize_name(self.browser)}_session"
 
 
 def sanitize_name(value: str) -> str:
@@ -63,6 +70,8 @@ def parse_websites_md(path: Path) -> list[WebsiteQuery]:
                 "site": header_match.group(1),
                 "number": int(header_match.group(2)),
                 "disabled": False,
+                "browser": DEFAULT_BROWSER,
+                "nofill": False,
                 "query": None,
                 "line": i,
             }
@@ -73,6 +82,14 @@ def parse_websites_md(path: Path) -> list[WebsiteQuery]:
 
         if line == "- disabled":
             current["disabled"] = True
+            continue
+
+        if line == "- chromium":
+            current["browser"] = CHROMIUM_BROWSER
+            continue
+
+        if line == "- nofill":
+            current["nofill"] = True
             continue
 
         if current.get("query") is None:
@@ -91,6 +108,8 @@ def parse_websites_md(path: Path) -> list[WebsiteQuery]:
             number=int(s["number"]),
             query=str(s["query"]),
             disabled=bool(s["disabled"]),
+            browser=str(s["browser"]),
+            nofill=bool(s["nofill"]),
         )
         for s in sections
     ]

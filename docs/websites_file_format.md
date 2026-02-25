@@ -19,6 +19,8 @@ Each section must contain:
 
 Optional lines:
 - `- disabled` to mark the section as disabled.
+- `- chromium` to run this section with Playwright Chromium (default is Firefox).
+- `- nofill` to disable human-login webpage injection for this section (no login-field prefill/capture).
 - Comments using HTML comment syntax: `<!-- comment text -->`.
 
 # Parsing Rules
@@ -32,6 +34,8 @@ Optional lines:
 # Example (`websites.md`)
 ```markdown
 # twitter.com 0
+- chromium
+- nofill
 - disabled
 get the ten most recent notifications
 # weather.com 0

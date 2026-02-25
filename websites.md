@@ -1,4 +1,6 @@
 # twitter.com 0
+- chromium
+- nofill
 get the list of the most recent notifications
 # weather.com 0
 - disabled
