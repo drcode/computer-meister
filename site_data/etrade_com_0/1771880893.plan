@@ -1,0 +1,5 @@
+target_site "https://etrade.com"
+login_required
+enable_text_entry
+explore_website_openai "Navigate to the 'Accounts' or 'Portfolio' section. Look for an account selector or list to find the 'Conrad' portfolio. Once on the 'Conrad' account page, click on the 'Positions' tab to view stock holdings. Locate the stock symbols, quantities, and the cash balance (often labeled as 'Cash', 'Net Cash', or 'Purchasing Power')." 80
+answer_query_text "List the stock holdings (symbol and quantity) and the cash balance for the 'Conrad' portfolio. If 'Conrad' is not found, provide the information for the primary account visible and note the name of that account."

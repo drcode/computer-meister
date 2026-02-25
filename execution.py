@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from openai import OpenAI
-from playwright.async_api import BrowserContext, Page, async_playwright
+from playwright.async_api import BrowserContext, Page, TimeoutError as PlaywrightTimeoutError, async_playwright
 
 from ai import load_openai_api_key, openai
 from html_preprocessor import preprocess_html
@@ -79,41 +79,9 @@ class ArtifactRecorder:
 
         screenshot_bytes = await page.screenshot(path=str(screenshot_path))
         main_html = await page.content()
-        combined_html = main_html
+        main_html = _filter_artifact_html(main_html)
 
-        # Some sites render critical data inside iframes (e.g., portfolio grids).
-        # Include per-frame DOM snapshots so downstream parsing can see that content.
-        frame_sections: list[str] = []
-        for frame_index, frame in enumerate(page.frames):
-            if frame == page.main_frame:
-                continue
-            try:
-                frame_html = await frame.content()
-            except Exception:
-                continue
-            if not frame_html.strip():
-                continue
-            frame_name = frame.name or "(unnamed)"
-            frame_url = frame.url or "(no url)"
-            frame_sections.append(
-                "\n".join(
-                    [
-                        f"<!-- BEGIN FRAME {frame_index}: {frame_name} | {frame_url} -->",
-                        frame_html,
-                        f"<!-- END FRAME {frame_index} -->",
-                    ]
-                )
-            )
-
-        if frame_sections:
-            combined_html = (
-                f"{main_html}\n\n"
-                "<!-- BEGIN EMBEDDED FRAME SNAPSHOTS -->\n"
-                f"{chr(10).join(frame_sections)}\n"
-                "<!-- END EMBEDDED FRAME SNAPSHOTS -->\n"
-            )
-
-        html_path.write_text(combined_html, encoding="utf-8")
+        html_path.write_text(main_html, encoding="utf-8")
 
         event = {
             "index": idx,
@@ -140,6 +108,35 @@ class ArtifactRecorder:
     def latest_pages(self, count: int = 4) -> list[Path]:
         pairs = sorted(self.artifact_dir.glob("page_*.html"), key=_artifact_index)
         return pairs[-count:]
+
+
+def _filter_artifact_html(raw_html: str) -> str:
+    try:
+        import lxml.html
+        from lxml import etree
+
+        doc = lxml.html.fromstring(raw_html)
+        selectors = [
+            "script",
+            "style",
+            "noscript",
+            "svg",
+            "link",
+            "object",
+            "embed",
+            "applet",
+            "img",
+        ]
+        for selector in selectors:
+            for el in doc.cssselect(selector):
+                el.getparent().remove(el)
+
+        for comment in doc.iter(etree.Comment):
+            comment.getparent().remove(comment)
+
+        return lxml.html.tostring(doc, encoding="unicode", pretty_print=False)
+    except Exception:
+        return raw_html
 
 
 def _artifact_index(path: Path) -> int:
@@ -244,6 +241,37 @@ def _responses_text(response: Any) -> str:
     return "\n".join(parts).strip()
 
 
+def _screenshot_is_single_color(png_bytes: bytes) -> bool:
+    if not png_bytes:
+        return True
+    try:
+        from io import BytesIO
+
+        from PIL import Image  # type: ignore[import-not-found]
+
+        img = Image.open(BytesIO(png_bytes)).convert("RGB")
+        width, height = img.size
+        if width <= 0 or height <= 0:
+            return True
+        base = img.getpixel((0, 0))
+
+        # Sample a grid (plus implicit corners/center) to avoid false negatives on small spinners.
+        sample_x = 50
+        sample_y = 50
+        denom_x = max(1, sample_x - 1)
+        denom_y = max(1, sample_y - 1)
+        for iy in range(sample_y):
+            y = (iy * (height - 1)) // denom_y
+            for ix in range(sample_x):
+                x = (ix * (width - 1)) // denom_x
+                if img.getpixel((x, y)) != base:
+                    return False
+        return True
+    except Exception:
+        # Solid-color PNGs compress extremely well; use a size heuristic as a last resort.
+        return len(png_bytes) < 15000
+
+
 async def _safe_goto(page: Page, url: str, *, timeout_ms: int = 35000) -> None:
     candidates = [url]
     if not url.startswith(("http://", "https://")):
@@ -254,6 +282,35 @@ async def _safe_goto(page: Page, url: str, *, timeout_ms: int = 35000) -> None:
         try:
             await page.goto(candidate, wait_until="domcontentloaded", timeout=timeout_ms)
             return
+        except PlaywrightTimeoutError as exc:
+            last_error = exc
+
+            async def _accept_if_rendered() -> bool:
+                try:
+                    await page.wait_for_timeout(1000)
+                except Exception:
+                    pass
+                try:
+                    png_bytes = await page.screenshot()
+                except Exception:
+                    return False
+                if _screenshot_is_single_color(png_bytes):
+                    return False
+                return True
+
+            # If the page rendered something meaningful, proceed even if DOMContentLoaded never fired.
+            if await _accept_if_rendered():
+                return
+
+            # If we only got a blank/solid-color frame, retry with a weaker wait condition.
+            try:
+                await page.goto(candidate, wait_until="commit", timeout=timeout_ms)
+                if await _accept_if_rendered():
+                    return
+            except Exception as commit_exc:  # noqa: BLE001
+                last_error = commit_exc
+                if await _accept_if_rendered():
+                    return
         except Exception as exc:  # noqa: BLE001
             last_error = exc
 
@@ -350,6 +407,9 @@ def _computer_action_to_plan_command(action: dict[str, Any]) -> PlanCommand:
 
     if action_type == "wait":
         return PlanCommand("wait", (int(action.get("ms", 500)),))
+
+    if action_type == "move":
+        return PlanCommand("wait", (500,))
 
     if action_type == "scroll":
         scroll_x = int(action.get("scroll_x", 0))
@@ -957,18 +1017,37 @@ class PlanExecutor:
             capture = await self.recorder.capture(self.page, source="answer_query_text_autocapture")
             pages = [capture["html_path"]]
 
+        latest_page = max(pages, key=_artifact_index)
+        try:
+            import html2text
+
+            converter = html2text.HTML2Text()
+            converter.body_width = 0
+            converter.ignore_links = True
+        except Exception as exc:
+            raise RuntimeError("html2text is required for answer_query_text but could not be imported") from exc
+
         page_chunks: list[str] = []
         for page_path in pages:
             raw = page_path.read_text(encoding="utf-8", errors="replace")
+            if page_path == latest_page:
+                try:
+                    processed = preprocess_html(raw)
+                except Exception:
+                    processed = raw
+                page_chunks.append(f"FILE: {page_path.name}\nCURRENT_HTML:\n{processed}")
+
             try:
-                processed = preprocess_html(raw)
-            except Exception:
-                processed = raw
-            processed = processed[:45000]
-            page_chunks.append(f"FILE: {page_path.name}\n{processed}")
+                page_text = converter.handle(raw)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"html2text conversion failed for {page_path.name} in answer_query_text"
+                ) from exc
+            page_chunks.append(f"FILE: {page_path.name}\nPAGE_TEXT_HTML2TEXT:\n{page_text}")
 
         prompt = (
-            "Answer the query strictly from the provided webpage HTML snapshots.\n"
+            "Answer the query strictly from the provided webpage snapshots.\n"
+            "Each file includes PAGE_TEXT_HTML2TEXT for all pages, and CURRENT_HTML only for the newest page snapshot.\n"
             f"Original query: {self.query.query}\n"
             f"Answer instruction: {instruction}\n\n"
             "If the evidence is insufficient or contradictory, start with FAIL and explain what is missing.\n\n"

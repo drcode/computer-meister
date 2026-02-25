@@ -1,0 +1,4 @@
+target_site "https://etrade.com"
+login_required
+explore_website_openai "Find the 'Conrad' or 'Conrads' account. Locate the stock holdings (symbols and quantities) and the cash balance. Check both the 'Positions' and 'Balances' tabs to ensure both are captured." 40
+answer_query_text "Answer this exactly: find the stock holdings in the "Conrad" portfolio, also the cash balance (or margin balance) for the account.. If uncertain, begin with FAIL and explain what is missing."

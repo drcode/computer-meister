@@ -553,8 +553,8 @@ def create_plan_for_query(query: WebsiteQuery, session_id: str, query_dir: Path)
     prompt = _make_updated_prompt(query, history) if history else _make_initial_prompt(query)
     prompt = (
         prompt
-        + "\n\n"
-        + """Runtime strategy for create_plan:
+        + """
+- Always consider the data requested and the site, to determine if this would logically require the user to be logged in to the site. If this is the case, include the "human_login" command.
 - Optimize for expected wall-clock runtime, not plan length; a plan with 10 cheap commands is generally better than one with a single expensive command.
 - Commands `explore_website_openai`, `login_required`, and `answer_query_*` each cost roughly 100x more wall-clock time than `click`, `type`, `keypress`, `wait`, or `vscroll`; lowering `max_command_steps` does not reduce exploration cost.
 - The "Exploration actions" listed under each previous successful attempt are already valid plan commands written in the plan syntax; they are the actual interaction sequence the explorer discovered.
@@ -574,14 +574,13 @@ def create_plan_for_query(query: WebsiteQuery, session_id: str, query_dir: Path)
             prompt,
             system=system,
             temperature=0,
-            max_output_tokens=1800,
         )
         response_payload = str(raw_plan_response)
         commands = parse_plan_text(response_payload)
         commands = _normalize_plan(commands, query, history_exists=bool(history))
     except Exception as exc:  # noqa: BLE001
         plan_error = exc
-        commands = _default_plan(query, history_exists=bool(history))
+        raise
     finally:
         _write_llm_call_log(
             artifacts_dir,

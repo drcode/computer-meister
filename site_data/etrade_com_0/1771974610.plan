@@ -1,0 +1,5 @@
+target_site "https://etrade.com"
+login_required
+enable_text_entry
+explore_website_openai "Find the 'Conrad' or 'Conrads' account. Navigate to the 'Positions' tab to capture stock symbols and quantities. Also find the cash or margin balance, checking the 'Balances' tab if necessary." 40
+answer_query_text "Provide the stock holdings (symbol and quantity) and the cash/margin balance for the Conrad portfolio. If uncertain, explain what is missing."

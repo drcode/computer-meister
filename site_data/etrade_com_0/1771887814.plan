@@ -1,0 +1,5 @@
+target_site "https://etrade.com"
+login_required
+enable_text_entry
+explore_website_openai "Navigate to the 'Conrad' account by looking for it in the account list or using the account switcher. Once the 'Conrad' account is active, click on the 'Positions' tab. Locate the table containing stock symbols and quantities, and find the cash balance (often listed as 'Net Cash' or 'Cash'). Ensure the positions table is visible." 80
+answer_query_text "List the stock holdings (symbol and quantity) and the cash balance for the 'Conrad' portfolio. If 'Conrad' is not found, provide the information for the primary account visible and specify the account name."

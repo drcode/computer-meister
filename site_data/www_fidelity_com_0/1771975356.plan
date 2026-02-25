@@ -1,0 +1,5 @@
+target_site "https://www.fidelity.com"
+login_required
+enable_text_entry
+explore_website_openai "Navigate to the accounts summary, identify the portfolio with the largest balance, and locate its stock holdings and cash or margin balance." 50
+answer_query_text "List the stock holdings for the largest portfolio and state the cash balance or margin balance."

@@ -11,8 +11,8 @@ def preprocess_html(raw_html: str) -> str:
 
     # 1. Remove elements that are never informational
     tags_to_remove = [
-        "script", "style", "noscript", "svg", "link",
-        "iframe", "object", "embed", "applet",
+        "script", "style", "noscript", "svg", "path", "link", "meta",
+        "object", "embed", "applet",
         "picture > source",  # keep <img> but drop responsive source hints
     ]
     for tag in tags_to_remove:
@@ -25,7 +25,7 @@ def preprocess_html(raw_html: str) -> str:
         comment.getparent().remove(comment)
 
     # 3. Strip non-structural attributes (biggest token saver)
-    KEEP_ATTRS = {"href", "src", "alt", "title", "id", "name", "type",
+    KEEP_ATTRS = {"src", "alt", "title", "id", "name", "type",
                   "value", "placeholder", "aria-label", "role", "datetime"}
     for el in doc.iter():
         if not isinstance(el.tag, str):
@@ -41,7 +41,22 @@ def preprocess_html(raw_html: str) -> str:
            "visibility:hidden" in style.replace(" ", ""):
             el.getparent().remove(el)
 
-    # 5. Remove <head> entirely (metadata, not content) — optional
+    # 5. Remove empty non-void elements to reduce wrapper noise.
+    VOID_TAGS = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input",
+        "link", "meta", "param", "source", "track", "wbr",
+    }
+    for el in reversed(list(doc.iter())):
+        if not isinstance(el.tag, str):
+            continue
+        if el.tag.lower() in VOID_TAGS:
+            continue
+        if el.getparent() is None:
+            continue
+        if len(el) == 0 and not el.text_content().strip():
+            el.getparent().remove(el)
+
+    # 6. Remove <head> entirely (metadata, not content) — optional
     head = doc.find(".//head")
     if head is not None:
         # Optionally preserve <title> text before removing
@@ -49,7 +64,7 @@ def preprocess_html(raw_html: str) -> str:
         title_text = title_el.text_content() if title_el is not None else None
         head.getparent().remove(head)
 
-    # 6. Collapse whitespace in text nodes
+    # 7. Collapse whitespace in text nodes
     for el in doc.iter():
         if el.text:
             el.text = re.sub(r'\s+', ' ', el.text).strip()

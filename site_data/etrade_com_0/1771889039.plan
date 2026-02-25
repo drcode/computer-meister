@@ -1,0 +1,5 @@
+target_site "https://etrade.com"
+login_required
+enable_text_entry
+explore_website_openai "Find the 'Conrad' or 'Conrads -6012' account. Go to the 'Positions' tab to list all stock symbols and quantities. Then, find the cash balance for this account, which might be under a 'Balances' tab, a 'Cash' line item in positions, or at the bottom of the page. Ensure both holdings and cash are captured in snapshots." 80
+answer_query_text "List the stock holdings (symbol and quantity) and the cash balance for the 'Conrad' portfolio. If 'Conrad' is not found, use 'Conrads -6012'."
