@@ -30,6 +30,10 @@ ANSWER_MODEL = "gpt-5.2"
 SESSION_STORAGE_FILE = "session_storage.json"
 COOKIES_FILE = "cookies.json"
 GLOBAL_LOGIN_INFO_FILE = Path.home() / "computer_meister_login_info.json"
+FIREFOX_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0.2"
+FIREFOX_STEALTH_PREFS = {
+    "dom.webdriver.enabled": False,
+}
 
 
 @dataclass(frozen=True)
@@ -199,13 +203,14 @@ def _dump_json(value: Any) -> str:
 
 def _launch_context_kwargs(headless: bool) -> dict[str, Any]:
     args = list(BROWSER_ARGS)
-    base = {"args": args}
+    base = {"args": args, "user_agent": FIREFOX_USER_AGENT}
 
     if not headless:
         return {
             **base,
             "headless": False,
             "no_viewport": True,
+            "firefox_user_prefs": FIREFOX_STEALTH_PREFS,
             "args": args + [f"--window-size={DISPLAY_WIDTH},{DISPLAY_HEIGHT}"],
         }
 
@@ -537,6 +542,8 @@ class PlanExecutor:
             str(self.session_dir),
             **_launch_context_kwargs(headless=headless),
         )
+        if not headless:
+            await self._install_human_login_stealth_init_script()
         await self._install_session_storage_init_script()
         await self._restore_cookies()
         self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
@@ -1068,6 +1075,27 @@ class PlanExecutor:
 	  );
 	}})();
 	"""
+        await self._context.add_init_script(script=script)
+
+    async def _install_human_login_stealth_init_script(self) -> None:
+        if self._context is None:
+            return
+        script = """
+(() => {
+  try {
+    Object.defineProperty(navigator, "webdriver", {
+      get: () => undefined,
+      configurable: true,
+    });
+  } catch (_) {}
+  try {
+    delete window.__playwright__binding__;
+  } catch (_) {}
+  try {
+    delete window.__pwInitScripts;
+  } catch (_) {}
+})();
+"""
         await self._context.add_init_script(script=script)
 
     async def _install_login_field_capture(self) -> None:
