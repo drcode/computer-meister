@@ -24,8 +24,8 @@ def _run_single_query(query: WebsiteQuery, session_id: str, locks: LockRegistry)
     try:
         _plan_path, commands, _history = create_plan_for_query(query, session_id, query_dir)
 
-        site_lock = locks.site_lock_for(query.site)
-        with site_lock:
+        session_lock = locks.session_lock_for(query.session_dir_name)
+        with session_lock:
             outcome = run_query_execution(
                 query=query,
                 commands=commands,

@@ -1,4 +1,5 @@
 __pycache__
 *_session/
+*_sessionx/
 *_artifacts/
 browser_data/

@@ -29,7 +29,7 @@ COMPUTER_USE_MODEL = "computer-use-preview"
 ANSWER_MODEL = "gpt-5.2"
 SESSION_STORAGE_FILE = "session_storage.json"
 COOKIES_FILE = "cookies.json"
-LOGIN_FORM_MEMORY_FILE = "login_form_memory.json"
+GLOBAL_LOGIN_INFO_FILE = Path.home() / "computer_meister_login_info.json"
 
 
 @dataclass(frozen=True)
@@ -45,17 +45,17 @@ class QueryOutcome:
 
 class LockRegistry:
     def __init__(self) -> None:
-        self._site_locks: dict[str, threading.Lock] = {}
-        self._site_locks_guard = threading.Lock()
+        self._session_locks: dict[str, threading.Lock] = {}
+        self._session_locks_guard = threading.Lock()
         self.login_prompt_lock = threading.Lock()
 
-    def site_lock_for(self, site: str) -> threading.Lock:
-        key = site.lower().strip()
-        with self._site_locks_guard:
-            lock = self._site_locks.get(key)
+    def session_lock_for(self, session_key: str) -> threading.Lock:
+        key = session_key.strip().lower()
+        with self._session_locks_guard:
+            lock = self._session_locks.get(key)
             if lock is None:
                 lock = threading.Lock()
-                self._site_locks[key] = lock
+                self._session_locks[key] = lock
             return lock
 
 
@@ -474,7 +474,7 @@ class PlanExecutor:
         self.openai_client = OpenAI(api_key=load_openai_api_key())
         self.session_storage_path = self.session_dir / SESSION_STORAGE_FILE
         self.cookies_path = self.session_dir / COOKIES_FILE
-        self.login_form_memory_path = self.session_dir / LOGIN_FORM_MEMORY_FILE
+        self.login_form_memory_path = GLOBAL_LOGIN_INFO_FILE
         self._captured_login_fields: dict[tuple[str, str, str], dict[str, Any]] = {}
 
         self._playwright = None
@@ -639,8 +639,8 @@ class PlanExecutor:
             await self._persist_session_storage_from_context()
             await self._persist_cookies()
         finally:
-            self.login_prompt_lock.release()
             await self._close_context()
+            self.login_prompt_lock.release()
 
         await self._launch_context(headless=True)
         await _safe_goto(self.page, self.target_url)
@@ -778,7 +778,7 @@ class PlanExecutor:
         return out
 
     def _save_login_form_memory_snapshot(self, records: list[dict[str, Any]]) -> None:
-        self.session_dir.mkdir(parents=True, exist_ok=True)
+        self.login_form_memory_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": 1,
             "saved_at": datetime.now(timezone.utc).isoformat(),
@@ -841,65 +841,233 @@ class PlanExecutor:
 
   const exactMap = new Map();
   const originMap = new Map();
-  for (const item of records) {{
-    if (!item || typeof item !== "object") continue;
-    const origin = item.origin || "";
-    const path = item.path || "/";
-    const fp = item.fingerprint || "";
-    const value = item.value;
-    if (!origin || !fp || typeof value !== "string") continue;
-    const updated = Number(item.updated_at || 0);
-    const exactKey = `${{origin}}|${{path}}|${{fp}}`;
-    const prevExact = exactMap.get(exactKey);
-    if (!prevExact || Number(prevExact.updated_at || 0) <= updated) {{
-      exactMap.set(exactKey, item);
-    }}
-    const originKey = `${{origin}}|${{fp}}`;
-    const prevOrigin = originMap.get(originKey);
-    if (!prevOrigin || Number(prevOrigin.updated_at || 0) <= updated) {{
-      originMap.set(originKey, item);
-    }}
-  }}
+	  for (const item of records) {{
+	    if (!item || typeof item !== "object") continue;
+	    const origin = item.origin || "";
+	    const path = item.path || "/";
+	    const fp = item.fingerprint || "";
+	    const value = item.value;
+	    if (!origin || !fp || typeof value !== "string") continue;
+	    const updated = Number(item.updated_at || 0);
+	    const exactKey = `${{origin}}|${{path}}|${{fp}}`;
+	    const prevExact = exactMap.get(exactKey);
+	    if (!prevExact || Number(prevExact.updated_at || 0) <= updated) {{
+	      exactMap.set(exactKey, item);
+	    }}
+	    const originKey = `${{origin}}|${{fp}}`;
+	    const prevOrigin = originMap.get(originKey);
+	    if (!prevOrigin || Number(prevOrigin.updated_at || 0) <= updated) {{
+	      originMap.set(originKey, item);
+	    }}
+	  }}
 
-  const applyPrefill = () => {{
-    const origin = window.location.origin;
-    const path = window.location.pathname || "/";
-    const fields = document.querySelectorAll("input, textarea");
-    for (const field of fields) {{
-      if (!(field instanceof HTMLElement)) continue;
-      const type = norm(field.type);
-      if (excludedTypes.has(type)) continue;
-      if ("disabled" in field && field.disabled) continue;
-      if ("readOnly" in field && field.readOnly) continue;
-      const currentValue = (field.value || "").toString();
-      if (currentValue.length > 0) continue;
-      const fp = fieldFingerprint(field);
-      if (!fp) continue;
-      const exactKey = `${{origin}}|${{path}}|${{fp}}`;
-      const originKey = `${{origin}}|${{fp}}`;
-      const match = exactMap.get(exactKey) || originMap.get(originKey);
-      if (!match || typeof match.value !== "string") continue;
-      field.focus();
-      field.value = match.value;
-      field.dispatchEvent(new Event("input", {{ bubbles: true }}));
-      field.dispatchEvent(new Event("change", {{ bubbles: true }}));
-    }}
-  }};
+	  const prefillState = new WeakMap();
 
-  const scheduleApply = () => {{
-    applyPrefill();
-    setTimeout(applyPrefill, 250);
-    setTimeout(applyPrefill, 1000);
-    setTimeout(applyPrefill, 2500);
-  }};
+	  const markAutofillEvent = (event) => {{
+	    if (!event) return event;
+	    try {{
+	      Object.defineProperty(event, "__cmAutofill", {{ value: true }});
+	    }} catch (_) {{
+	      try {{
+	        event.__cmAutofill = true;
+	      }} catch (_) {{}}
+	    }}
+	    return event;
+	  }};
 
-  if (document.readyState === "loading") {{
-    document.addEventListener("DOMContentLoaded", scheduleApply, {{ once: true }});
-  }} else {{
-    scheduleApply();
-  }}
-}})();
-"""
+	  const makeEvent = (type) => markAutofillEvent(new Event(type, {{ bubbles: true, composed: true, cancelable: true }}));
+	  const makeInputEvent = (type) => {{
+	    try {{
+	      return markAutofillEvent(
+	        new InputEvent(type, {{
+	          bubbles: true,
+	          composed: true,
+	          cancelable: true,
+	          inputType: "insertReplacementText",
+	          data: null,
+	        }})
+	      );
+	    }} catch (_) {{
+	      return makeEvent(type);
+	    }}
+	  }};
+
+	  const dispatch = (field, event) => {{
+	    try {{
+	      field.dispatchEvent(event);
+	    }} catch (_) {{}}
+	  }};
+
+	  const dispatchValueEvents = (field) => {{
+	    dispatch(field, makeInputEvent("beforeinput"));
+	    dispatch(field, makeInputEvent("input"));
+	    dispatch(field, makeEvent("change"));
+	  }};
+
+	  // Use the native "value" setter to play nicely with React/value trackers.
+	  const setNativeValue = (element, value) => {{
+	    try {{
+	      const valueDescriptor = Object.getOwnPropertyDescriptor(element, "value");
+	      const valueSetter = valueDescriptor && valueDescriptor.set;
+	      const prototype = Object.getPrototypeOf(element);
+	      const prototypeDescriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+	      const prototypeValueSetter = prototypeDescriptor && prototypeDescriptor.set;
+	      if (prototypeValueSetter && valueSetter !== prototypeValueSetter) {{
+	        prototypeValueSetter.call(element, value);
+	      }} else if (valueSetter) {{
+	        valueSetter.call(element, value);
+	      }} else {{
+	        element.value = value;
+	      }}
+	    }} catch (_) {{
+	      try {{
+	        element.value = value;
+	      }} catch (_) {{}}
+	    }}
+	  }};
+
+	  const eligibleField = (field) => {{
+	    if (!(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement)) return false;
+	    const type = norm(field.type);
+	    if (excludedTypes.has(type)) return false;
+	    if (field.disabled || field.readOnly) return false;
+	    return true;
+	  }};
+
+	  const matchForField = (field, origin, path) => {{
+	    const fp = fieldFingerprint(field);
+	    if (!fp) return null;
+	    const exactKey = `${{origin}}|${{path}}|${{fp}}`;
+	    const originKey = `${{origin}}|${{fp}}`;
+	    const match = exactMap.get(exactKey) || originMap.get(originKey);
+	    if (!match || typeof match.value !== "string") return null;
+	    return {{ fp, value: match.value }};
+	  }};
+
+	  const applyField = (field, origin, path, now) => {{
+	    if (!eligibleField(field)) return;
+	    const match = matchForField(field, origin, path);
+	    if (!match) return;
+
+	    const currentValue = (field.value || "").toString();
+	    const state = prefillState.get(field);
+
+	    if (!currentValue) {{
+	      setNativeValue(field, match.value);
+	      dispatchValueEvents(field);
+	      prefillState.set(field, {{ value: match.value, filledAt: now, rearmed: false }});
+	      return;
+	    }}
+
+	    // Some sites/frameworks only attach input handlers after hydration. If we filled before that,
+	    // replay a single "change" in a way that triggers value watchers (React) without user input.
+	    if (!state) return;
+	    if (state.rearmed) return;
+	    if (state.value !== match.value) return;
+	    if (currentValue !== match.value) return;
+	    if (document.activeElement === field) return;
+
+	    const ageMs = now - Number(state.filledAt || 0);
+	    if (ageMs < 150) return;
+	    if (ageMs > 8000) {{
+	      state.rearmed = true;
+	      return;
+	    }}
+
+	    const tracker = field && field._valueTracker;
+	    if (tracker && typeof tracker.setValue === "function") {{
+	      try {{
+	        tracker.setValue("");
+	      }} catch (_) {{}}
+	      dispatch(field, makeInputEvent("input"));
+	      dispatch(field, makeEvent("change"));
+	      state.rearmed = true;
+	      return;
+	    }}
+
+	    let hasPatchedValueSetter = false;
+	    try {{
+	      const valueDescriptor = Object.getOwnPropertyDescriptor(field, "value");
+	      const prototype = Object.getPrototypeOf(field);
+	      const prototypeDescriptor = Object.getOwnPropertyDescriptor(prototype, "value");
+	      hasPatchedValueSetter = Boolean(
+	        valueDescriptor &&
+	          prototypeDescriptor &&
+	          typeof valueDescriptor.set === "function" &&
+	          typeof prototypeDescriptor.set === "function" &&
+	          valueDescriptor.set !== prototypeDescriptor.set
+	      );
+	    }} catch (_) {{}}
+
+	    if (!hasPatchedValueSetter) {{
+	      // Late-bound listeners: re-dispatch without mutating the visible value.
+	      dispatchValueEvents(field);
+	      state.rearmed = true;
+	      return;
+	    }}
+
+	    // Patched setters (React-like): clear + restore to force a detected change.
+	    setNativeValue(field, "");
+	    dispatchValueEvents(field);
+	    setNativeValue(field, match.value);
+	    dispatchValueEvents(field);
+	    state.rearmed = true;
+	  }};
+
+	  const applyPrefill = () => {{
+	    const origin = window.location.origin;
+	    const path = window.location.pathname || "/";
+	    const now = Date.now();
+	    const fields = document.querySelectorAll("input, textarea");
+	    for (const field of fields) {{
+	      if (!(field instanceof HTMLElement)) continue;
+	      applyField(field, origin, path, now);
+	    }}
+	  }};
+
+	  const scheduleApply = () => {{
+	    applyPrefill();
+	    setTimeout(applyPrefill, 250);
+	    setTimeout(applyPrefill, 1000);
+	    setTimeout(applyPrefill, 2500);
+	    setTimeout(applyPrefill, 6000);
+	  }};
+
+	  if (document.readyState === "loading") {{
+	    document.addEventListener("DOMContentLoaded", scheduleApply, {{ once: true }});
+	  }} else {{
+	    scheduleApply();
+	  }}
+
+	  let queued = false;
+	  const queueApply = () => {{
+	    if (queued) return;
+	    queued = true;
+	    setTimeout(() => {{
+	      queued = false;
+	      applyPrefill();
+	    }}, 150);
+	  }};
+
+	  try {{
+	    const observer = new MutationObserver(queueApply);
+	    observer.observe(document.documentElement, {{ childList: true, subtree: true }});
+	  }} catch (_) {{}}
+
+	  document.addEventListener(
+	    "focusin",
+	    (event) => {{
+	      const field = event && event.target;
+	      if (!(field instanceof HTMLElement)) return;
+	      const origin = window.location.origin;
+	      const path = window.location.pathname || "/";
+	      const now = Date.now();
+	      applyField(field, origin, path, now);
+	    }},
+	    true
+	  );
+	}})();
+	"""
         await self._context.add_init_script(script=script)
 
     async def _install_login_field_capture(self) -> None:
@@ -1013,13 +1181,15 @@ class PlanExecutor:
     }
   };
 
-  document.addEventListener("change", (event) => {
-    captureField(event && event.target);
-  }, true);
+	  document.addEventListener("change", (event) => {
+	    if (event && event.__cmAutofill) return;
+	    captureField(event && event.target);
+	  }, true);
 
-  document.addEventListener("blur", (event) => {
-    captureField(event && event.target);
-  }, true);
+	  document.addEventListener("blur", (event) => {
+	    if (event && event.__cmAutofill) return;
+	    captureField(event && event.target);
+	  }, true);
 
   document.addEventListener("submit", (event) => {
     const form = event && event.target;
