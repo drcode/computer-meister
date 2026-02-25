@@ -1,7 +1,0 @@
-target_site "https://weather.com"
-enable_text_entry
-click 950 35
-type "Mill Valley, CA"
-keypress Enter
-wait 3000
-answer_query_text "What is the current temperature in Mill Valley, CA?"

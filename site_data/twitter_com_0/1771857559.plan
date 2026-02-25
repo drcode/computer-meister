@@ -1,4 +1,0 @@
-target_site "https://twitter.com"
-login_required
-explore_website_openai "Navigate to the notifications page (usually twitter.com/notifications). Once there, scroll down slightly to ensure at least 10 notifications are loaded in the DOM, then scroll back to the top." 20
-answer_query_text "List the ten most recent notifications based on the notifications page content."

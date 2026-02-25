@@ -29,6 +29,7 @@ COMPUTER_USE_MODEL = "computer-use-preview"
 ANSWER_MODEL = "gpt-5.2"
 SESSION_STORAGE_FILE = "session_storage.json"
 COOKIES_FILE = "cookies.json"
+LOGIN_FORM_MEMORY_FILE = "login_form_memory.json"
 
 
 @dataclass(frozen=True)
@@ -473,6 +474,8 @@ class PlanExecutor:
         self.openai_client = OpenAI(api_key=load_openai_api_key())
         self.session_storage_path = self.session_dir / SESSION_STORAGE_FILE
         self.cookies_path = self.session_dir / COOKIES_FILE
+        self.login_form_memory_path = self.session_dir / LOGIN_FORM_MEMORY_FILE
+        self._captured_login_fields: dict[tuple[str, str, str], dict[str, Any]] = {}
 
         self._playwright = None
         self._context: BrowserContext | None = None
@@ -622,6 +625,8 @@ class PlanExecutor:
             self.headless = False
             self.help_used = True
             await self._launch_context(headless=False)
+            await self._install_login_form_prefill_init_script()
+            await self._install_login_field_capture()
             await _safe_goto(self.page, self.target_url)
             print(
                 f"\nLogin required for {self.query.section_id}. "
@@ -629,6 +634,8 @@ class PlanExecutor:
                 flush=True,
             )
             await asyncio.get_event_loop().run_in_executor(None, input)
+            await self.page.wait_for_timeout(300)
+            self._persist_login_form_memory()
             await self._persist_session_storage_from_context()
             await self._persist_cookies()
         finally:
@@ -722,6 +729,338 @@ class PlanExecutor:
             if normalized:
                 cleaned[origin] = normalized
         return cleaned
+
+    def _load_login_form_memory_snapshot(self) -> list[dict[str, Any]]:
+        if not self.login_form_memory_path.exists():
+            return []
+        try:
+            payload = json.loads(self.login_form_memory_path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        records = payload.get("records") if isinstance(payload, dict) else None
+        if not isinstance(records, list):
+            return []
+
+        out: list[dict[str, Any]] = []
+        for item in records:
+            if not isinstance(item, dict):
+                continue
+            origin = item.get("origin")
+            path = item.get("path")
+            fingerprint = item.get("fingerprint")
+            value = item.get("value")
+            if not isinstance(origin, str) or not origin:
+                continue
+            if not isinstance(path, str):
+                path = "/"
+            if not isinstance(fingerprint, str) or not fingerprint:
+                continue
+            if value is None:
+                value = ""
+            if not isinstance(value, str):
+                value = str(value)
+
+            updated_at = item.get("updated_at")
+            if not isinstance(updated_at, int):
+                updated_at = int(time.time() * 1000)
+
+            out.append(
+                {
+                    "origin": origin,
+                    "path": path,
+                    "fingerprint": fingerprint,
+                    "value": value,
+                    "is_password": bool(item.get("is_password", False)),
+                    "input_type": str(item.get("input_type", "")),
+                    "updated_at": updated_at,
+                }
+            )
+        return out
+
+    def _save_login_form_memory_snapshot(self, records: list[dict[str, Any]]) -> None:
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+            "records": records,
+        }
+        self.login_form_memory_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    async def _install_login_form_prefill_init_script(self) -> None:
+        if self._context is None:
+            return
+        records = self._load_login_form_memory_snapshot()
+        if not records:
+            return
+        serialized = json.dumps(records)
+        script = f"""
+(() => {{
+  const records = {serialized};
+  const excludedTypes = new Set(["hidden", "submit", "button", "reset", "file", "image", "checkbox", "radio"]);
+
+  const norm = (value) => (value || "").toString().trim().toLowerCase();
+  const safeText = (value) => (value || "").toString().trim().replace(/\\s+/g, " ").slice(0, 120).toLowerCase();
+  const textFor = (node) => safeText((node && (node.innerText || node.textContent)) || "");
+
+  const fieldFingerprint = (field) => {{
+    const tag = norm(field.tagName);
+    const type = norm(field.type);
+    const id = norm(field.id);
+    const name = norm(field.getAttribute("name"));
+    const autocomplete = norm(field.getAttribute("autocomplete"));
+    let placeholder = safeText(field.getAttribute("placeholder"));
+    if (!placeholder) {{
+      placeholder = safeText(field.placeholder);
+    }}
+    let label = "";
+    if (id) {{
+      const forLabel = document.querySelector(`label[for="${{CSS.escape(id)}}"]`);
+      if (forLabel) {{
+        label = textFor(forLabel);
+      }}
+    }}
+    if (!label) {{
+      const parentLabel = field.closest("label");
+      if (parentLabel) {{
+        label = textFor(parentLabel);
+      }}
+    }}
+    if (!label) {{
+      const labelledBy = field.getAttribute("aria-labelledby");
+      if (labelledBy) {{
+        for (const token of labelledBy.split(/\\s+/g)) {{
+          const el = document.getElementById(token);
+          if (!el) continue;
+          label += " " + textFor(el);
+        }}
+        label = safeText(label);
+      }}
+    }}
+    return [tag, type, autocomplete, name, id, placeholder, label].join("|");
+  }};
+
+  const exactMap = new Map();
+  const originMap = new Map();
+  for (const item of records) {{
+    if (!item || typeof item !== "object") continue;
+    const origin = item.origin || "";
+    const path = item.path || "/";
+    const fp = item.fingerprint || "";
+    const value = item.value;
+    if (!origin || !fp || typeof value !== "string") continue;
+    const updated = Number(item.updated_at || 0);
+    const exactKey = `${{origin}}|${{path}}|${{fp}}`;
+    const prevExact = exactMap.get(exactKey);
+    if (!prevExact || Number(prevExact.updated_at || 0) <= updated) {{
+      exactMap.set(exactKey, item);
+    }}
+    const originKey = `${{origin}}|${{fp}}`;
+    const prevOrigin = originMap.get(originKey);
+    if (!prevOrigin || Number(prevOrigin.updated_at || 0) <= updated) {{
+      originMap.set(originKey, item);
+    }}
+  }}
+
+  const applyPrefill = () => {{
+    const origin = window.location.origin;
+    const path = window.location.pathname || "/";
+    const fields = document.querySelectorAll("input, textarea");
+    for (const field of fields) {{
+      if (!(field instanceof HTMLElement)) continue;
+      const type = norm(field.type);
+      if (excludedTypes.has(type)) continue;
+      if ("disabled" in field && field.disabled) continue;
+      if ("readOnly" in field && field.readOnly) continue;
+      const currentValue = (field.value || "").toString();
+      if (currentValue.length > 0) continue;
+      const fp = fieldFingerprint(field);
+      if (!fp) continue;
+      const exactKey = `${{origin}}|${{path}}|${{fp}}`;
+      const originKey = `${{origin}}|${{fp}}`;
+      const match = exactMap.get(exactKey) || originMap.get(originKey);
+      if (!match || typeof match.value !== "string") continue;
+      field.focus();
+      field.value = match.value;
+      field.dispatchEvent(new Event("input", {{ bubbles: true }}));
+      field.dispatchEvent(new Event("change", {{ bubbles: true }}));
+    }}
+  }};
+
+  const scheduleApply = () => {{
+    applyPrefill();
+    setTimeout(applyPrefill, 250);
+    setTimeout(applyPrefill, 1000);
+    setTimeout(applyPrefill, 2500);
+  }};
+
+  if (document.readyState === "loading") {{
+    document.addEventListener("DOMContentLoaded", scheduleApply, {{ once: true }});
+  }} else {{
+    scheduleApply();
+  }}
+}})();
+"""
+        await self._context.add_init_script(script=script)
+
+    async def _install_login_field_capture(self) -> None:
+        if self._context is None:
+            return
+        self._captured_login_fields = {}
+
+        def _capture_binding(_: Any, payload: Any) -> None:
+            if not isinstance(payload, dict):
+                return
+            origin = payload.get("origin")
+            path = payload.get("path")
+            fingerprint = payload.get("fingerprint")
+            value = payload.get("value")
+            if not isinstance(origin, str) or not origin:
+                return
+            if not isinstance(path, str):
+                path = "/"
+            if not isinstance(fingerprint, str) or not fingerprint:
+                return
+            if value is None:
+                value = ""
+            if not isinstance(value, str):
+                value = str(value)
+            record = {
+                "origin": origin,
+                "path": path,
+                "fingerprint": fingerprint,
+                "value": value,
+                "is_password": bool(payload.get("is_password", False)),
+                "input_type": str(payload.get("input_type", "")),
+                "updated_at": int(payload.get("captured_at_ms", int(time.time() * 1000))),
+            }
+            key = (record["origin"], record["path"], record["fingerprint"])
+            prior = self._captured_login_fields.get(key)
+            if prior is None or int(prior.get("updated_at", 0)) <= int(record["updated_at"]):
+                self._captured_login_fields[key] = record
+
+        await self._context.expose_binding("cmRecordLoginField", _capture_binding)
+
+        script = """
+(() => {
+  if (window.__cmLoginCaptureInstalled) return;
+  window.__cmLoginCaptureInstalled = true;
+
+  const excludedTypes = new Set(["hidden", "submit", "button", "reset", "file", "image", "checkbox", "radio"]);
+  const norm = (value) => (value || "").toString().trim().toLowerCase();
+  const safeText = (value) => (value || "").toString().trim().replace(/\\s+/g, " ").slice(0, 120).toLowerCase();
+  const textFor = (node) => safeText((node && (node.innerText || node.textContent)) || "");
+
+  const fieldFingerprint = (field) => {
+    const tag = norm(field.tagName);
+    const type = norm(field.type);
+    const id = norm(field.id);
+    const name = norm(field.getAttribute("name"));
+    const autocomplete = norm(field.getAttribute("autocomplete"));
+    let placeholder = safeText(field.getAttribute("placeholder"));
+    if (!placeholder) {
+      placeholder = safeText(field.placeholder);
+    }
+    let label = "";
+    if (id) {
+      const forLabel = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+      if (forLabel) {
+        label = textFor(forLabel);
+      }
+    }
+    if (!label) {
+      const parentLabel = field.closest("label");
+      if (parentLabel) {
+        label = textFor(parentLabel);
+      }
+    }
+    if (!label) {
+      const labelledBy = field.getAttribute("aria-labelledby");
+      if (labelledBy) {
+        for (const token of labelledBy.split(/\\s+/g)) {
+          const el = document.getElementById(token);
+          if (!el) continue;
+          label += " " + textFor(el);
+        }
+        label = safeText(label);
+      }
+    }
+    return [tag, type, autocomplete, name, id, placeholder, label].join("|");
+  };
+
+  const eligible = (field) => {
+    if (!field) return false;
+    if (!(field instanceof HTMLInputElement || field instanceof HTMLTextAreaElement)) return false;
+    const type = norm(field.type);
+    if (excludedTypes.has(type)) return false;
+    if (field.disabled || field.readOnly) return false;
+    return true;
+  };
+
+  const captureField = (field) => {
+    if (!eligible(field)) return;
+    const payload = {
+      origin: window.location.origin || "",
+      path: window.location.pathname || "/",
+      fingerprint: fieldFingerprint(field),
+      value: (field.value || "").toString(),
+      input_type: norm(field.type),
+      is_password: norm(field.type) === "password",
+      captured_at_ms: Date.now(),
+    };
+    if (!payload.origin || !payload.fingerprint) return;
+    if (typeof window.cmRecordLoginField === "function") {
+      window.cmRecordLoginField(payload);
+    }
+  };
+
+  document.addEventListener("change", (event) => {
+    captureField(event && event.target);
+  }, true);
+
+  document.addEventListener("blur", (event) => {
+    captureField(event && event.target);
+  }, true);
+
+  document.addEventListener("submit", (event) => {
+    const form = event && event.target;
+    if (!(form instanceof HTMLFormElement)) return;
+    const fields = form.querySelectorAll("input, textarea");
+    for (const field of fields) {
+      captureField(field);
+    }
+  }, true);
+})();
+"""
+        await self._context.add_init_script(script=script)
+
+    def _persist_login_form_memory(self) -> None:
+        if not self._captured_login_fields:
+            return
+        existing = self._load_login_form_memory_snapshot()
+        merged: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for item in existing:
+            key = (
+                str(item.get("origin", "")),
+                str(item.get("path", "/")),
+                str(item.get("fingerprint", "")),
+            )
+            if not key[0] or not key[2]:
+                continue
+            merged[key] = item
+
+        for key, item in self._captured_login_fields.items():
+            prior = merged.get(key)
+            if prior is None or int(prior.get("updated_at", 0)) <= int(item.get("updated_at", 0)):
+                merged[key] = item
+
+        records = sorted(
+            merged.values(),
+            key=lambda record: int(record.get("updated_at", 0)),
+            reverse=True,
+        )
+        # Keep recent records only, to bound file growth.
+        records = records[:300]
+        self._save_login_form_memory_snapshot(records)
 
     def _save_session_storage_snapshot(self, snapshot: dict[str, dict[str, str]]) -> None:
         self.session_dir.mkdir(parents=True, exist_ok=True)

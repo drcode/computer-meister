@@ -1,0 +1,5 @@
+target_site "https://etrade.com"
+login_required
+enable_text_entry
+explore_website_openai "Navigate to the 'Conrad' portfolio. Identify all stock holdings and the cash or margin balance for this account." 30
+answer_query_text "List the stock holdings in the 'Conrad' portfolio and the cash or margin balance for the account."

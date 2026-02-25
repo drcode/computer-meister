@@ -1,5 +1,0 @@
-target_site "https://fidelity.com"
-login_required
-enable_text_entry
-explore_website_openai "Navigate to the portfolio summary, find the 'large portfolio' account, and list the stock holdings and cash balance." 80
-answer_query_text "List the stock holdings and the cash or margin balance for the 'large portfolio'."

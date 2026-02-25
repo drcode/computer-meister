@@ -1,4 +1,0 @@
-target_site "https://finance.yahoo.com"
-enable_text_entry
-explore_website_openai "Search for AMZN and navigate to its quote page to find the current price." 15
-answer_query_text "What is the most recent price of AMZN?"

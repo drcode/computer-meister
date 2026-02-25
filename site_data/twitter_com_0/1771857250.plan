@@ -1,4 +1,0 @@
-target_site "https://twitter.com"
-login_required
-explore_website_openai "Wait for the notifications list to load and ensure the most recent items are visible." 15
-answer_query_text "List the ten most recent notifications."

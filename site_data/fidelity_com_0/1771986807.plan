@@ -1,6 +1,0 @@
-target_site "https://fidelity.com"
-login_required
-enable_text_entry
-explore_website_openai "Navigate to the Portfolio Summary page. Locate the account named 'large portfolio' and click on it. Once the account is selected, click on the 'Positions' tab. Ensure that the list of stock holdings (symbols and quantities) and the cash or margin balance are visible on the screen. Scroll down if necessary to reveal all holdings. Do not log out or navigate away once the information is displayed." 80
-wait 3000
-answer_query_text "List the stock holdings and the cash or margin balance for the 'large portfolio' account. If the account name is slightly different, use the one that best matches 'large portfolio'. If the information is not visible, state what is missing."

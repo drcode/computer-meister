@@ -1,3 +1,0 @@
-target_site "https://etrade.com"
-explore_website_openai "Explore the site to locate the information needed to answer: find the stock holdings in the "Conrad" portfolio, also the cash balance for the account." 12
-answer_query_text "Answer this exactly: find the stock holdings in the "Conrad" portfolio, also the cash balance for the account.. If uncertain, begin with FAIL and explain what is missing."

@@ -1,4 +1,0 @@
-target_site "https://weather.com"
-enable_text_entry
-explore_website_openai "Search for 'Mill Valley, CA' and find the current temperature." 8
-answer_query_text "What is the current temperature in Mill Valley, CA?"

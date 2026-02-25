@@ -1,5 +1,0 @@
-target_site "https://etrade.com"
-login_required
-enable_text_entry
-explore_website_openai "Find and click on the account named 'Conrad' or 'Conrads -6012'. Once the account is selected, click on the 'Positions' tab. Locate the stock holdings table (symbols and quantities) and the cash balance (often labeled as 'Net Cash' or 'Cash'). Ensure these details are visible on the screen." 80
-answer_query_text "List the stock holdings (symbol and quantity) and the cash balance for the 'Conrad' portfolio. If 'Conrad' is not found, use the data for 'Conrads -6012'."
