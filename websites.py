@@ -19,6 +19,7 @@ class WebsiteQuery:
     disabled: bool = False
     browser: str = DEFAULT_BROWSER
     nofill: bool = False
+    nocapture: bool = False
 
     @property
     def section_id(self) -> str:
@@ -72,6 +73,7 @@ def parse_websites_md(path: Path) -> list[WebsiteQuery]:
                 "disabled": False,
                 "browser": DEFAULT_BROWSER,
                 "nofill": False,
+                "nocapture": False,
                 "query": None,
                 "line": i,
             }
@@ -92,6 +94,10 @@ def parse_websites_md(path: Path) -> list[WebsiteQuery]:
             current["nofill"] = True
             continue
 
+        if line == "- nocapture":
+            current["nocapture"] = True
+            continue
+
         if current.get("query") is None:
             current["query"] = line
             continue
@@ -110,6 +116,7 @@ def parse_websites_md(path: Path) -> list[WebsiteQuery]:
             disabled=bool(s["disabled"]),
             browser=str(s["browser"]),
             nofill=bool(s["nofill"]),
+            nocapture=bool(s["nocapture"]),
         )
         for s in sections
     ]

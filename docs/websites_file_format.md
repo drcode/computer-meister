@@ -21,7 +21,10 @@ Optional lines:
 - `- disabled` to mark the section as disabled.
 - `- chromium` to run this section with Playwright Chromium (default is Firefox).
 - `- nofill` to disable human-login webpage injection for this section (no login-field prefill/capture).
+- `- nocapture` to disable login-field capture only; prefill remains enabled.
 - Comments using HTML comment syntax: `<!-- comment text -->`.
+
+If both `- nofill` and `- nocapture` are present, `- nofill` takes precedence.
 
 # Parsing Rules
 - One section per query target.
@@ -39,6 +42,7 @@ Optional lines:
 - disabled
 get the ten most recent notifications
 # weather.com 0
+- nocapture
 get the temperature in Mill Valley, CA
 # finance.yahoo.com 0
 - disabled

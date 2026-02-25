@@ -671,8 +671,11 @@ class PlanExecutor:
             self.headless = False
             self.help_used = True
             await self._launch_context(headless=False)
-            if not self.query.nofill:
+            prefill_enabled = not self.query.nofill
+            capture_enabled = prefill_enabled and not self.query.nocapture
+            if prefill_enabled:
                 await self._install_login_form_prefill_init_script()
+            if capture_enabled:
                 await self._install_login_field_capture()
             await _safe_goto(self.page, self.target_url)
             print(
@@ -682,7 +685,7 @@ class PlanExecutor:
             )
             await asyncio.get_event_loop().run_in_executor(None, input)
             await self.page.wait_for_timeout(300)
-            if not self.query.nofill:
+            if capture_enabled:
                 self._persist_login_form_memory()
             await self._persist_session_storage_from_context()
             await self._persist_cookies()
