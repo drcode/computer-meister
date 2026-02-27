@@ -1,0 +1,5 @@
+target_site "https://fidelity.com"
+login_required
+enable_text_entry
+explore_website_openai "Navigate to the Portfolio Summary page. Locate and click on the 'Joint WROS' account. Once the account is selected, go to the 'Positions' tab to identify all stock holdings and the 'Balances' tab to find the cash or margin balance. Ensure the final view shows these details clearly." 80
+answer_query_text "List the stock holdings and the cash or margin balance for the Joint WROS portfolio. If the information is not visible, describe what is seen on the account summary page."

@@ -1,0 +1,8 @@
+target_site "https://weather.com"
+enable_text_entry
+click 828 32
+type "Mill Valley, CA"
+wait 2000
+click 778 126
+wait 2000
+answer_query_text "What is the current temperature in Mill Valley, CA?"

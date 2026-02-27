@@ -1,0 +1,8 @@
+target_site "https://finance.yahoo.com"
+enable_text_entry
+click 539 326
+type "AMZN"
+wait 1000
+click 454 404
+wait 2000
+answer_query_text "What is the most recent price of AMZN?"

@@ -3,12 +3,14 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterable
 
 
 HEADER_RE = re.compile(r"^#\s+([^\s]+)\s+(\d+)\s*$")
 COMMENT_RE = re.compile(r"^<!--.*-->$")
 DEFAULT_BROWSER = "firefox"
 CHROMIUM_BROWSER = "chromium"
+SUPPORTED_BROWSERS = {DEFAULT_BROWSER, CHROMIUM_BROWSER}
 
 
 @dataclass(frozen=True)
@@ -41,6 +43,15 @@ def sanitize_name(value: str) -> str:
     cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", value.strip().lower())
     cleaned = cleaned.strip("_")
     return cleaned or "site"
+
+
+def _validate_unique_headers(queries: Iterable[WebsiteQuery]) -> None:
+    seen: set[tuple[str, int]] = set()
+    for item in queries:
+        key = (item.site, item.number)
+        if key in seen:
+            raise ValueError(f"Duplicate section header: {item.site} {item.number}")
+        seen.add(key)
 
 
 def parse_websites_md(path: Path) -> list[WebsiteQuery]:
@@ -121,12 +132,40 @@ def parse_websites_md(path: Path) -> list[WebsiteQuery]:
         for s in sections
     ]
 
-    # Validate site+number uniqueness.
-    seen: set[tuple[str, int]] = set()
-    for item in out:
-        key = (item.site, item.number)
-        if key in seen:
-            raise ValueError(f"Duplicate section header: {item.site} {item.number}")
-        seen.add(key)
-
+    _validate_unique_headers(out)
     return out
+
+
+def render_websites_md(queries: list[WebsiteQuery]) -> str:
+    _validate_unique_headers(queries)
+    lines: list[str] = []
+    for query in queries:
+        site = query.site.strip()
+        question = query.query.strip()
+        if not site:
+            raise ValueError("site cannot be empty when writing websites.md")
+        if not question:
+            raise ValueError(f"Section '{query.section_id}' must have a non-empty query line")
+        if query.browser not in SUPPORTED_BROWSERS:
+            raise ValueError(f"Unsupported browser '{query.browser}' in section '{query.section_id}'")
+
+        lines.append(f"# {site} {query.number}")
+        if query.disabled:
+            lines.append("- disabled")
+        if query.browser == CHROMIUM_BROWSER:
+            lines.append("- chromium")
+        if query.nofill:
+            lines.append("- nofill")
+        if query.nocapture:
+            lines.append("- nocapture")
+        lines.append(question)
+        lines.append("")
+
+    if not lines:
+        return ""
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_websites_md(path: Path, queries: list[WebsiteQuery]) -> None:
+    text = render_websites_md(queries)
+    path.write_text(text, encoding="utf-8")

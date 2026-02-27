@@ -1,0 +1,4 @@
+target_site "https://twitter.com"
+login_required
+explore_website_openai "Navigate to the notifications page." 10
+answer_query_text "List the most recent notifications."

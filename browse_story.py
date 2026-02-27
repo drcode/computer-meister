@@ -154,7 +154,8 @@ def _discover_attempts(query_dir: Path) -> list[SessionInstance]:
         success: bool | None = None
         if results_path.exists():
             _, body = _parse_results_file(results_path)
-            success = bool(body) and not body.lstrip().startswith("FAIL")
+            stripped = body.lstrip()
+            success = bool(body) and not stripped.startswith("FAIL") and not stripped.startswith("SKIP")
 
         out.append(
             SessionInstance(
@@ -588,7 +589,12 @@ def _render_exploration(runs: list[dict[str, Any]], artifacts_dir: Path, output_
                     screenshot_path = artifacts_dir / screenshot_name
                     if screenshot_path.exists():
                         rel = _relative_path(output_file, screenshot_path)
-                        blocks.append(f'<a href="{html.escape(rel)}"><img src="{html.escape(rel)}" loading="lazy" /></a>')
+                        blocks.append('<span class="step-screenshot">')
+                        blocks.append(
+                            f'<a href="{html.escape(rel)}"><img class="exploration-thumb" src="{html.escape(rel)}" loading="lazy" /></a>'
+                        )
+                        blocks.append('<span class="coord-tooltip" aria-hidden="true"></span>')
+                        blocks.append("</span>")
 
                 if page_name:
                     blocks.append(f"<p class=\"meta\">page snapshot: {html.escape(page_name)}</p>")
@@ -713,6 +719,11 @@ def _build_story_html(history: QueryHistory, instance: SessionInstance, output_f
         "    .steps { display: grid; gap: 12px; margin-top: 12px; }",
         "    .step { background: #f9fbff; border: 1px solid var(--border); border-radius: 10px; padding: 10px; }",
         "    img { max-width: 100%; border-radius: 8px; border: 1px solid #cfd7e4; }",
+        "    .step-screenshot { position: relative; display: inline-block; max-width: 100%; }",
+        "    .step-screenshot > a { display: inline-block; line-height: 0; max-width: 100%; }",
+        "    .step-screenshot img { display: block; }",
+        "    .coord-tooltip { position: fixed; z-index: 9999; display: none; pointer-events: none; background: rgba(15, 23, 36, 0.92); color: #f6f8fc; border: 1px solid #4d5f79; border-radius: 6px; padding: 2px 7px; font-size: 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; box-shadow: 0 3px 10px rgba(0, 0, 0, 0.25); }",
+        "    .coord-tooltip.visible { display: block; }",
         "    .gallery { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }",
         "    figure { margin: 0; }",
         "    figcaption { margin-top: 8px; color: var(--muted); font-size: 0.9rem; }",
@@ -867,6 +878,52 @@ def _build_story_html(history: QueryHistory, instance: SessionInstance, output_f
             "        move(1);",
             "      }",
             "    }",
+            "  });",
+            "",
+            "  const explorationThumbs = Array.from(document.querySelectorAll('.exploration-thumb'));",
+            "  explorationThumbs.forEach((img) => {",
+            "    const wrapper = img.closest('.step-screenshot');",
+            "    if (!wrapper) {",
+            "      return;",
+            "    }",
+            "    const tooltip = wrapper.querySelector('.coord-tooltip');",
+            "    if (!tooltip) {",
+            "      return;",
+            "    }",
+            "",
+            "    function clamp(value, min, max) {",
+            "      return Math.min(max, Math.max(min, value));",
+            "    }",
+            "",
+            "    function updateTooltip(event) {",
+            "      const rect = img.getBoundingClientRect();",
+            "      if (rect.width <= 0 || rect.height <= 0) {",
+            "        return;",
+            "      }",
+            "      const naturalWidth = img.naturalWidth || Math.round(rect.width);",
+            "      const naturalHeight = img.naturalHeight || Math.round(rect.height);",
+            "      if (naturalWidth <= 0 || naturalHeight <= 0) {",
+            "        return;",
+            "      }",
+            "",
+            "      const localX = clamp(event.clientX - rect.left, 0, rect.width);",
+            "      const localY = clamp(event.clientY - rect.top, 0, rect.height);",
+            "      const x = clamp(Math.floor((localX / rect.width) * naturalWidth), 0, naturalWidth - 1);",
+            "      const y = clamp(Math.floor((localY / rect.height) * naturalHeight), 0, naturalHeight - 1);",
+            "",
+            "      tooltip.textContent = `x: ${x}, y: ${y}`;",
+            "      tooltip.style.left = `${event.clientX + 12}px`;",
+            "      tooltip.style.top = `${event.clientY + 12}px`;",
+            "    }",
+            "",
+            "    img.addEventListener('mouseenter', (event) => {",
+            "      tooltip.classList.add('visible');",
+            "      updateTooltip(event);",
+            "    });",
+            "    img.addEventListener('mousemove', updateTooltip);",
+            "    img.addEventListener('mouseleave', () => {",
+            "      tooltip.classList.remove('visible');",
+            "    });",
             "  });",
             "</script>",
             "</body>",

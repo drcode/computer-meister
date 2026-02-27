@@ -1,0 +1,5 @@
+target_site "https://twitter.com"
+login_required
+enable_text_entry
+explore_website_openai "Navigate to the notifications page (bell icon) and view the most recent notifications." 15
+answer_query_text "List the most recent notifications."

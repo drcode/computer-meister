@@ -1,0 +1,5 @@
+target_site "https://fidelity.com"
+login_required
+enable_text_entry
+explore_website_openai "Navigate to the Portfolio page. In the account list, click on the 'Joint WROS' account. Once the account is selected, click on the 'Positions' tab and scroll through the list to ensure all stock holdings are visible. Then, click on the 'Balances' tab and locate the cash balance, margin balance, or 'Available to trade'/'Settled cash' values." 80
+answer_query_text "List the stock holdings and the cash or margin balance for the Joint WROS portfolio. If 'Cash balance' is not explicitly labeled, report the 'Available to trade' or 'Settled cash' value. If the account is not found, list the names of all visible accounts."
