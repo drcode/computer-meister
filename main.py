@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import concurrent.futures
 import json
 import time
@@ -10,7 +11,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from playwright.async_api import async_playwright
+
 from browse_story import run_browse_story_mode
+from execution_common import _launch_context_kwargs
 from execution import (
     GLOBAL_LOGIN_INFO_FILE,
     LockRegistry,
@@ -30,12 +34,14 @@ from websites import (
 
 MODE_SCRAPE = "scrape"
 MODE_SCRAPE_HEADLESS = "scrape-headless"
+MODE_MANUAL = "manual"
 MODE_BROWSE = "browse"
 MODE_EDIT_LOGINS = "edit-logins"
 MODE_EDIT_WEBSITES = "edit-websites"
 SUPPORTED_MODES = [
     MODE_SCRAPE,
     MODE_SCRAPE_HEADLESS,
+    MODE_MANUAL,
     MODE_BROWSE,
     MODE_EDIT_LOGINS,
     MODE_EDIT_WEBSITES,
@@ -175,6 +181,65 @@ def _run_scrape_mode(*, websites_path: Path, allow_manual_login: bool) -> None:
         for future in concurrent.futures.as_completed(futures):
             outcome = future.result()
             _print_completion(outcome)
+
+
+async def _run_manual_session(*, query: WebsiteQuery, session_dir: Path) -> None:
+    session_dir.mkdir(parents=True, exist_ok=True)
+    browser = CHROMIUM_BROWSER if query.browser == CHROMIUM_BROWSER else DEFAULT_BROWSER
+    launch_kwargs = _launch_context_kwargs(browser=browser, headless=False)
+    target_url = query.site if query.site.startswith(("http://", "https://")) else f"https://{query.site}"
+
+    playwright = await async_playwright().start()
+    context = None
+    try:
+        if browser == CHROMIUM_BROWSER:
+            context = await playwright.chromium.launch_persistent_context(
+                str(session_dir),
+                **launch_kwargs,
+            )
+        else:
+            context = await playwright.firefox.launch_persistent_context(
+                str(session_dir),
+                **launch_kwargs,
+            )
+
+        page = context.pages[0] if context.pages else await context.new_page()
+        try:
+            await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Navigation warning for {target_url}: {exc}", flush=True)
+
+        print(
+            f"Manual session for {query.section_id} using {browser}.",
+            flush=True,
+        )
+        print("Interact in the browser window. Press ENTER here to close the session.", flush=True)
+        await asyncio.to_thread(input)
+    finally:
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:
+                pass
+        await playwright.stop()
+
+
+def _run_manual_mode(*, websites_path: Path) -> None:
+    try:
+        queries = parse_websites_md(websites_path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"Could not parse {websites_path}: {exc}", flush=True)
+        return
+
+    targets = _enabled_queries(queries)
+    if not targets:
+        print("No enabled queries found in websites.md", flush=True)
+        return
+
+    query = targets[0]
+    base_dir = Path("site_data")
+    session_dir = base_dir / query.session_dir_name
+    asyncio.run(_run_manual_session(query=query, session_dir=session_dir))
 
 
 def _normalize_site(value: str) -> str:
@@ -745,7 +810,7 @@ def main() -> None:
         nargs="?",
         choices=SUPPORTED_MODES,
         help=(
-            "Mode: scrape, scrape-headless, browse, edit-logins, edit-websites. "
+            "Mode: scrape, scrape-headless, manual, browse, edit-logins, edit-websites. "
             "If omitted, uses the last selected mode (default: scrape)."
         ),
     )
@@ -772,6 +837,10 @@ def main() -> None:
 
     if mode == MODE_SCRAPE_HEADLESS:
         _run_scrape_mode(websites_path=websites_path, allow_manual_login=False)
+        return
+
+    if mode == MODE_MANUAL:
+        _run_manual_mode(websites_path=websites_path)
         return
 
     _run_scrape_mode(websites_path=websites_path, allow_manual_login=True)
