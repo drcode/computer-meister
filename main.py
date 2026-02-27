@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 from playwright.async_api import async_playwright
 
 from browse_story import run_browse_story_mode
-from execution_common import _launch_context_kwargs
+from execution_common import COOKIES_FILE, SESSION_STORAGE_FILE, _launch_context_kwargs
 from execution import (
     GLOBAL_LOGIN_INFO_FILE,
     LockRegistry,
@@ -183,11 +183,133 @@ def _run_scrape_mode(*, websites_path: Path, allow_manual_login: bool) -> None:
             _print_completion(outcome)
 
 
+def _load_session_storage_snapshot(path: Path) -> dict[str, dict[str, str]]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    cleaned: dict[str, dict[str, str]] = {}
+    for origin, items in payload.items():
+        if not isinstance(origin, str) or not isinstance(items, dict):
+            continue
+        normalized: dict[str, str] = {}
+        for key, value in items.items():
+            if not isinstance(key, str):
+                continue
+            if value is None:
+                normalized[key] = ""
+            elif isinstance(value, str):
+                normalized[key] = value
+            else:
+                normalized[key] = str(value)
+        if normalized:
+            cleaned[origin] = normalized
+    return cleaned
+
+
+def _save_session_storage_snapshot(path: Path, snapshot: dict[str, dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
+
+
+async def _install_session_storage_init_script(context: Any, session_storage_path: Path) -> None:
+    snapshot = _load_session_storage_snapshot(session_storage_path)
+    if not snapshot:
+        return
+    serialized = json.dumps(snapshot)
+    script = (
+        "(() => {"
+        f"const persisted = {serialized};"
+        "try {"
+        "  const origin = window.location.origin;"
+        "  const entries = persisted[origin];"
+        "  if (!entries || typeof entries !== 'object') return;"
+        "  for (const [k, v] of Object.entries(entries)) {"
+        "    try { sessionStorage.setItem(k, String(v)); } catch (_) {}"
+        "  }"
+        "} catch (_) {}"
+        "})();"
+    )
+    await context.add_init_script(script=script)
+
+
+async def _persist_session_storage_from_context(context: Any, session_storage_path: Path) -> None:
+    existing = _load_session_storage_snapshot(session_storage_path)
+    updated: dict[str, dict[str, str]] = dict(existing)
+
+    for page in context.pages:
+        raw_url = (page.url or "").strip()
+        parsed = urlparse(raw_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            continue
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        try:
+            values = await page.evaluate(
+                """() => {
+                    const out = {};
+                    for (let i = 0; i < sessionStorage.length; i += 1) {
+                        const key = sessionStorage.key(i);
+                        if (key === null) continue;
+                        const value = sessionStorage.getItem(key);
+                        out[key] = value === null ? "" : value;
+                    }
+                    return out;
+                }"""
+            )
+        except Exception:
+            continue
+
+        if not isinstance(values, dict):
+            continue
+        cleaned: dict[str, str] = {}
+        for key, value in values.items():
+            if not isinstance(key, str):
+                continue
+            if value is None:
+                cleaned[key] = ""
+            elif isinstance(value, str):
+                cleaned[key] = value
+            else:
+                cleaned[key] = str(value)
+        if cleaned:
+            updated[origin] = cleaned
+
+    if updated != existing:
+        _save_session_storage_snapshot(session_storage_path, updated)
+
+
+async def _restore_cookies(context: Any, cookies_path: Path) -> None:
+    if not cookies_path.exists():
+        return
+    try:
+        cookies = json.loads(cookies_path.read_text(encoding="utf-8"))
+        if isinstance(cookies, list) and cookies:
+            await context.add_cookies(cookies)
+    except Exception:
+        return
+
+
+async def _persist_cookies(context: Any, cookies_path: Path) -> None:
+    try:
+        cookies = await context.cookies()
+        cookies_path.parent.mkdir(parents=True, exist_ok=True)
+        cookies_path.write_text(json.dumps(cookies, indent=2), encoding="utf-8")
+    except Exception:
+        return
+
+
 async def _run_manual_session(*, query: WebsiteQuery, session_dir: Path) -> None:
     session_dir.mkdir(parents=True, exist_ok=True)
     browser = CHROMIUM_BROWSER if query.browser == CHROMIUM_BROWSER else DEFAULT_BROWSER
     launch_kwargs = _launch_context_kwargs(browser=browser, headless=False)
     target_url = query.site if query.site.startswith(("http://", "https://")) else f"https://{query.site}"
+    session_storage_path = session_dir / SESSION_STORAGE_FILE
+    cookies_path = session_dir / COOKIES_FILE
 
     playwright = await async_playwright().start()
     context = None
@@ -203,6 +325,8 @@ async def _run_manual_session(*, query: WebsiteQuery, session_dir: Path) -> None
                 **launch_kwargs,
             )
 
+        await _install_session_storage_init_script(context, session_storage_path)
+        await _restore_cookies(context, cookies_path)
         page = context.pages[0] if context.pages else await context.new_page()
         try:
             await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
@@ -217,6 +341,14 @@ async def _run_manual_session(*, query: WebsiteQuery, session_dir: Path) -> None
         await asyncio.to_thread(input)
     finally:
         if context is not None:
+            try:
+                await _persist_session_storage_from_context(context, session_storage_path)
+            except Exception:
+                pass
+            try:
+                await _persist_cookies(context, cookies_path)
+            except Exception:
+                pass
             try:
                 await context.close()
             except Exception:

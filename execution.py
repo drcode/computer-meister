@@ -27,12 +27,13 @@ from execution_common import (
 )
 from execution_content import AnsweringMixin, ArtifactRecorder
 from execution_exploration import ExplorationMixin, _execute_plan_interaction
+from execution_autologin import AutologinMixin
 from execution_login import LoginMixin
 from planning import PlanCommand
 from websites import WebsiteQuery
 
 
-class PlanExecutor(LoginMixin, ExplorationMixin, AnsweringMixin):
+class PlanExecutor(AutologinMixin, LoginMixin, ExplorationMixin, AnsweringMixin):
     def __init__(
         self,
         *,

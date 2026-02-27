@@ -17,9 +17,11 @@ from websites import WebsiteQuery, parse_websites_md
 LLM_ORDER = {
     "create_plan": 0,
     "is_logged_in_check": 1,
-    "exploration_loop": 2,
-    "answer_query_text": 3,
-    "answer_query_images": 3,
+    "autologin_loop": 2,
+    "autologin_error": 2,
+    "exploration_loop": 3,
+    "answer_query_text": 4,
+    "answer_query_images": 4,
 }
 
 
@@ -330,7 +332,7 @@ def _load_llm_logs(artifacts_dir: Path) -> list[LlmLogEntry]:
     for path in sorted(artifacts_dir.iterdir()):
         if not path.is_file():
             continue
-        if path.name == "exploration_steps.json":
+        if path.name in {"exploration_steps.json", "autologin_steps.json", "autologin_attempts.json"}:
             continue
         if path.name.startswith("page_") or path.name.startswith("screenshot_"):
             continue
@@ -390,6 +392,46 @@ def _load_llm_logs(artifacts_dir: Path) -> list[LlmLogEntry]:
 
 def _load_exploration_runs(artifacts_dir: Path) -> list[dict[str, Any]]:
     path = artifacts_dir / "exploration_steps.json"
+    if not path.exists():
+        return []
+
+    payload = _safe_json_loads(_read_text(path))
+    if not isinstance(payload, dict):
+        return []
+
+    runs = payload.get("runs")
+    if not isinstance(runs, list):
+        return []
+
+    cleaned: list[dict[str, Any]] = []
+    for run in runs:
+        if isinstance(run, dict):
+            cleaned.append(run)
+    return cleaned
+
+
+def _load_autologin_runs(artifacts_dir: Path) -> list[dict[str, Any]]:
+    path = artifacts_dir / "autologin_steps.json"
+    if not path.exists():
+        return []
+
+    payload = _safe_json_loads(_read_text(path))
+    if not isinstance(payload, dict):
+        return []
+
+    runs = payload.get("runs")
+    if not isinstance(runs, list):
+        return []
+
+    cleaned: list[dict[str, Any]] = []
+    for run in runs:
+        if isinstance(run, dict):
+            cleaned.append(run)
+    return cleaned
+
+
+def _load_autologin_attempts(artifacts_dir: Path) -> list[dict[str, Any]]:
+    path = artifacts_dir / "autologin_attempts.json"
     if not path.exists():
         return []
 
@@ -624,7 +666,160 @@ def _render_exploration(runs: list[dict[str, Any]], artifacts_dir: Path, output_
     return "\n".join(blocks)
 
 
-def _render_screenshot_gallery(runs: list[dict[str, Any]], artifacts_dir: Path, output_file: Path) -> str:
+def _render_autologin_story(
+    attempts: list[dict[str, Any]],
+    runs: list[dict[str, Any]],
+    artifacts_dir: Path,
+    output_file: Path,
+) -> str:
+    attempted = [item for item in attempts if bool(item.get("attempted", False))]
+    if not attempted:
+        return '<p class="muted">No autologin attempt was recorded for this instance.</p>'
+
+    run_by_timestamp: dict[str, dict[str, Any]] = {}
+    for run in runs:
+        ts = run.get("timestamp")
+        if isinstance(ts, str) and ts:
+            run_by_timestamp[ts] = run
+
+    blocks: list[str] = []
+    for idx, attempt in enumerate(attempted, start=1):
+        status = str(attempt.get("status", "unknown"))
+        site = str(attempt.get("site", ""))
+        target_url = str(attempt.get("target_url", ""))
+        timestamp = str(attempt.get("timestamp", ""))
+        before_artifact = attempt.get("before_artifact") if isinstance(attempt.get("before_artifact"), dict) else {}
+        result_artifact = attempt.get("result_artifact") if isinstance(attempt.get("result_artifact"), dict) else {}
+        before_artifact_error = str(attempt.get("before_artifact_error", "") or "")
+        result_artifact_error = str(attempt.get("result_artifact_error", "") or "")
+        stats_before = attempt.get("stats_before") if isinstance(attempt.get("stats_before"), dict) else {}
+        stats_after = attempt.get("stats_after") if isinstance(attempt.get("stats_after"), dict) else {}
+        run_ts = str(attempt.get("steps_run_timestamp", "") or "")
+        run = run_by_timestamp.get(run_ts)
+
+        blocks.append('<article class="card">')
+        blocks.append(f"<h3>Autologin attempt {idx}: {html.escape(status)}</h3>")
+        blocks.append(
+            "<p class=\"meta\">"
+            f"site: {html.escape(site)}"
+            f" | time: {html.escape(timestamp)}"
+            f"{' | target: ' + html.escape(target_url) if target_url else ''}"
+            "</p>"
+        )
+
+        if before_artifact:
+            before_screenshot = before_artifact.get("screenshot")
+            if isinstance(before_screenshot, str):
+                before_path = artifacts_dir / before_screenshot
+                if before_path.exists():
+                    rel = _relative_path(output_file, before_path)
+                    blocks.append(f"<p class=\"meta\">before screenshot: {html.escape(before_screenshot)}</p>")
+                    blocks.append(f'<a href="{html.escape(rel)}"><img src="{html.escape(rel)}" loading="lazy" /></a>')
+        if before_artifact_error:
+            blocks.append(f"<p class=\"meta\">before capture error: {html.escape(before_artifact_error)}</p>")
+
+        if result_artifact:
+            result_screenshot = result_artifact.get("screenshot")
+            if isinstance(result_screenshot, str):
+                result_path = artifacts_dir / result_screenshot
+                if result_path.exists():
+                    rel = _relative_path(output_file, result_path)
+                    blocks.append(f"<p class=\"meta\">result screenshot: {html.escape(result_screenshot)}</p>")
+                    blocks.append(f'<a href="{html.escape(rel)}"><img src="{html.escape(rel)}" loading="lazy" /></a>')
+        if result_artifact_error:
+            blocks.append(f"<p class=\"meta\">result capture error: {html.escape(result_artifact_error)}</p>")
+
+        if stats_before:
+            blocks.append("<details><summary>Backoff stats before</summary>")
+            blocks.append(_html_pre(stats_before))
+            blocks.append("</details>")
+        if stats_after:
+            blocks.append("<details><summary>Backoff stats after</summary>")
+            blocks.append(_html_pre(stats_after))
+            blocks.append("</details>")
+
+        if run is not None:
+            instruction = str(run.get("instruction", ""))
+            final_text = str(run.get("final_text", ""))
+            max_steps = run.get("max_command_steps")
+            steps = run.get("steps") if isinstance(run.get("steps"), list) else []
+
+            if instruction:
+                blocks.append(f"<p><strong>Computer-use instruction:</strong> {html.escape(instruction)}</p>")
+            blocks.append(f"<p class=\"meta\">autologin computer-use max steps: {html.escape(str(max_steps))}</p>")
+            if final_text:
+                blocks.append("<details><summary>Computer-use summary</summary>")
+                blocks.append(_html_pre(final_text))
+                blocks.append("</details>")
+
+            if steps:
+                blocks.append('<div class="steps">')
+                for step in steps:
+                    if not isinstance(step, dict):
+                        continue
+                    step_index = step.get("step")
+                    plan_command = step.get("plan_command") if isinstance(step.get("plan_command"), dict) else {}
+                    plan_line = str(plan_command.get("line", "")) if plan_command else ""
+                    command_name = str(plan_command.get("name", "")) if plan_command else ""
+                    computer_action = step.get("computer_action") if isinstance(step.get("computer_action"), dict) else {}
+                    computer_action_type = str(computer_action.get("type", "")) if computer_action else ""
+                    error = step.get("error")
+                    artifact = step.get("artifact") if isinstance(step.get("artifact"), dict) else {}
+                    screenshot_name = artifact.get("screenshot") if isinstance(artifact.get("screenshot"), str) else None
+                    page_name = artifact.get("page_html") if isinstance(artifact.get("page_html"), str) else None
+
+                    blocks.append('<div class="step">')
+                    label = command_name or computer_action_type
+                    blocks.append(
+                        f"<h4>Autologin step {html.escape(str(step_index))}"
+                        f" {html.escape(label) if label else ''}</h4>"
+                    )
+
+                    if screenshot_name:
+                        screenshot_path = artifacts_dir / screenshot_name
+                        if screenshot_path.exists():
+                            rel = _relative_path(output_file, screenshot_path)
+                            blocks.append('<span class="step-screenshot">')
+                            blocks.append(
+                                f'<a href="{html.escape(rel)}"><img class="exploration-thumb" src="{html.escape(rel)}" loading="lazy" /></a>'
+                            )
+                            blocks.append('<span class="coord-tooltip" aria-hidden="true"></span>')
+                            blocks.append("</span>")
+
+                    if page_name:
+                        blocks.append(f"<p class=\"meta\">page snapshot: {html.escape(page_name)}</p>")
+
+                    if plan_command:
+                        blocks.append("<details><summary>Plan command</summary>")
+                        if plan_line:
+                            blocks.append(_html_pre(plan_line))
+                        else:
+                            blocks.append(_html_pre(plan_command))
+                        blocks.append("</details>")
+                    elif computer_action:
+                        blocks.append("<details><summary>Computer action</summary>")
+                        blocks.append(_html_pre(computer_action))
+                        blocks.append("</details>")
+
+                    if error:
+                        blocks.append("<details><summary>Action error</summary>")
+                        blocks.append(_html_pre(error))
+                        blocks.append("</details>")
+
+                    blocks.append("</div>")
+                blocks.append("</div>")
+
+        blocks.append("</article>")
+
+    return "\n".join(blocks)
+
+
+def _render_screenshot_gallery(
+    runs: list[dict[str, Any]],
+    autologin_runs: list[dict[str, Any]],
+    artifacts_dir: Path,
+    output_file: Path,
+) -> str:
     screenshots = sorted(artifacts_dir.glob("screenshot_*.png"), key=_artifact_index)
     if not screenshots:
         return '<p class="muted">No screenshots found.</p>'
@@ -647,6 +842,26 @@ def _render_screenshot_gallery(runs: list[dict[str, Any]], artifacts_dir: Path, 
                 action_type = str(computer_action.get("type", "")) if computer_action else ""
             step_idx = step.get("step")
             notes[screenshot_name] = f"run {run_index}, step {step_idx}, action {action_type}".strip()
+
+    for run_index, run in enumerate(autologin_runs, start=1):
+        steps = run.get("steps") if isinstance(run.get("steps"), list) else []
+        for step in steps:
+            if not isinstance(step, dict):
+                continue
+            artifact = step.get("artifact") if isinstance(step.get("artifact"), dict) else {}
+            screenshot_name = artifact.get("screenshot") if isinstance(artifact.get("screenshot"), str) else None
+            if not screenshot_name:
+                continue
+            plan_command = step.get("plan_command") if isinstance(step.get("plan_command"), dict) else {}
+            if plan_command:
+                action_type = str(plan_command.get("name", ""))
+            else:
+                computer_action = step.get("computer_action") if isinstance(step.get("computer_action"), dict) else {}
+                action_type = str(computer_action.get("type", "")) if computer_action else ""
+            step_idx = step.get("step")
+            notes[screenshot_name] = (
+                f"autologin run {run_index}, step {step_idx}, action {action_type}".strip()
+            )
 
     items: list[str] = ['<div class="gallery-shell">']
     items.append('<div id="screenshot-gallery" class="gallery" role="list" aria-label="Screenshots">')
@@ -685,9 +900,12 @@ def _build_story_html(history: QueryHistory, instance: SessionInstance, output_f
     results_meta, results_body = _parse_results_file(instance.results_path)
     llm_logs = _load_llm_logs(instance.artifacts_dir)
     runs = _load_exploration_runs(instance.artifacts_dir)
+    autologin_runs = _load_autologin_runs(instance.artifacts_dir)
+    autologin_attempts = _load_autologin_attempts(instance.artifacts_dir)
 
     create_logs = [log for log in llm_logs if log.name == "create_plan"]
     non_create_logs = [log for log in llm_logs if log.name != "create_plan"]
+    has_attempted_autologin = any(bool(item.get("attempted", False)) for item in autologin_attempts)
 
     meta_lines: list[str] = []
     for key in ("time", "headless", "help"):
@@ -781,9 +999,25 @@ def _build_story_html(history: QueryHistory, instance: SessionInstance, output_f
     else:
         parts.append('<p class="muted">No create_plan log found.</p>')
 
-    parts.extend(
+    section_intro = [
+        "</section>",
+    ]
+    if has_attempted_autologin:
+        section_intro.extend(
+            [
+                "<section>",
+                "<h2>How Autologin Went</h2>",
+                _render_autologin_story(
+                    autologin_attempts,
+                    autologin_runs,
+                    instance.artifacts_dir,
+                    output_file,
+                ),
+                "</section>",
+            ]
+        )
+    section_intro.extend(
         [
-            "</section>",
             "<section>",
             "<h2>How The Site Was Browsed</h2>",
             _render_exploration(runs, instance.artifacts_dir, output_file),
@@ -792,6 +1026,7 @@ def _build_story_html(history: QueryHistory, instance: SessionInstance, output_f
             "<h2>LLM Prompts And Results</h2>",
         ]
     )
+    parts.extend(section_intro)
 
     if non_create_logs:
         for log in non_create_logs:
@@ -804,7 +1039,7 @@ def _build_story_html(history: QueryHistory, instance: SessionInstance, output_f
             "</section>",
             "<section>",
             "<h2>All Screenshots</h2>",
-            _render_screenshot_gallery(runs, instance.artifacts_dir, output_file),
+            _render_screenshot_gallery(runs, autologin_runs, instance.artifacts_dir, output_file),
             "</section>",
             "</main>",
             "<script>",

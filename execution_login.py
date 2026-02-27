@@ -18,9 +18,15 @@ class LoginMixin:
         if is_logged_in:
             return
 
+        autologin_succeeded = await self._attempt_autologin_if_eligible()
+        if autologin_succeeded:
+            await _safe_goto(self.page, self.target_url)
+            return
+
         if not self.allow_manual_login:
             raise ManualLoginRequiredError(
-                f"Manual login required for {self.query.section_id}; skipped in scrape-headless mode."
+                "Manual login required for "
+                f"{self.query.section_id}; skipped in scrape-headless mode after autologin evaluation."
             )
 
         await self._close_context()

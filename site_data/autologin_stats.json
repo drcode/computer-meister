@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "sites": {
+    "fidelity.com": {
+      "attempts_since_successful_login": 0,
+      "consecutive_autologin_failures": 0,
+      "backoff_remaining": 0,
+      "last_result": "autologin_success",
+      "updated_at": "2026-02-27T20:19:40.077644+00:00"
+    }
+  },
+  "saved_at": "2026-02-27T20:19:40.077802+00:00"
+}
