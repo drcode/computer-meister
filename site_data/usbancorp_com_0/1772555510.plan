@@ -1,0 +1,5 @@
+target_site "https://usbancorp.com"
+login_required
+enable_text_entry
+explore_website_openai "Navigate to the brokerage account ending in 0757. Locate the list of stock holdings with their share counts and the cash balance (which may be labeled as margin balance or margin debit)." 40
+answer_query_text "List the stock holdings and number of shares for the brokerage account ending in 0757. Also, state the cash balance, margin balance, or margin debit for this account."
