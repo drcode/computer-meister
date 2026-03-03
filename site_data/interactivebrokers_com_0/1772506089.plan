@@ -1,0 +1,6 @@
+target_site "https://interactivebrokers.com"
+login_required
+enable_text_entry
+wait 10000
+explore_website_openai "Navigate to the Client Portal. Once inside, click on the 'Portfolio' or 'Positions' tab. Locate the table containing stock symbols and the number of shares for each. Also, find the cash balance, which may be labeled as 'Net Cash', 'Total Cash', or 'Margin Balance' in the 'Balances' or 'Account Summary' section. If the page is still loading, wait until the data appears." 80
+answer_query_text "List each stock holding with the number of shares. Also, report the cash balance or margin balance of the account. If no stocks are found, state that the portfolio is empty."

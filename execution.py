@@ -170,9 +170,13 @@ class PlanExecutor(AutologinMixin, LoginMixin, ExplorationMixin, AnsweringMixin)
         self._print_plan_command(command)
 
         if name == "target_site":
-            self.target_url = str(command.args[0])
+            requested_url = str(command.args[0])
+            self.target_url = self._resolve_target_url(requested_url)
             await _safe_goto(self.page, self.target_url)
-            await self.recorder.capture(self.page, source="target_site", metadata={"url": self.target_url})
+            metadata: dict[str, Any] = {"url": self.target_url}
+            if self.target_url != requested_url:
+                metadata["requested_url"] = requested_url
+            await self.recorder.capture(self.page, source="target_site", metadata=metadata)
             return
 
         if name == "login_required":

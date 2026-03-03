@@ -1,0 +1,6 @@
+target_site "https://interactivebrokers.com"
+login_required
+enable_text_entry
+wait 10000
+explore_website_openai "Navigate to the Portfolio or Positions tab. Locate the table with stock symbols and share quantities. Also find the cash balance, which may be labeled as 'Net Cash', 'Total Cash', or 'Margin Balance'." 40
+answer_query_text "List each stock holding with the number of shares. Also, report the cash balance or margin balance of the account. If no stocks are found, state that the portfolio is empty."

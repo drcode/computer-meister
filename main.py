@@ -385,6 +385,19 @@ def _normalize_site(value: str) -> str:
     return host
 
 
+def _normalize_authenticated_url(value: Any) -> str:
+    if value is None:
+        return ""
+    text = value if isinstance(value, str) else str(value)
+    text = text.strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return text
+
+
 def _host_from_origin(origin: str) -> str:
     try:
         parsed = urlparse(origin)
@@ -497,11 +510,15 @@ def _load_login_info(path: Path) -> tuple[dict[str, Any], list[dict[str, Any]], 
             updated_at = item.get("updated_at")
             if not isinstance(updated_at, int):
                 updated_at = now_ms
-            credentials[site] = {
+            entry: dict[str, Any] = {
                 "username": username,
                 "password": password,
                 "updated_at": updated_at,
             }
+            authenticated_url = _normalize_authenticated_url(item.get("authenticated_url"))
+            if authenticated_url:
+                entry["authenticated_url"] = authenticated_url
+            credentials[site] = entry
 
     return payload, records, credentials
 
@@ -602,8 +619,13 @@ def run_edit_logins_mode(websites_path: Path) -> None:
                 source = "explicit" if site in credentials else "inferred"
                 username = str(entry.get("username", ""))
                 password = str(entry.get("password", ""))
+                authenticated_url = _normalize_authenticated_url(entry.get("authenticated_url"))
+                authenticated_url_suffix = f" authenticated_url={authenticated_url}" if authenticated_url else ""
                 print(
-                    f"  - {site} [{source}] username={_mask_secret(username)} password={_mask_secret(password)}",
+                    (
+                        f"  - {site} [{source}] username={_mask_secret(username)} "
+                        f"password={_mask_secret(password)}{authenticated_url_suffix}"
+                    ),
                     flush=True,
                 )
 
@@ -640,11 +662,18 @@ def run_edit_logins_mode(websites_path: Path) -> None:
                 continue
 
             now_ms = int(time.time() * 1000)
-            credentials[picked_site] = {
+            existing_entry = credentials.get(picked_site, {})
+            authenticated_url = _normalize_authenticated_url(
+                existing_entry.get("authenticated_url") if isinstance(existing_entry, dict) else ""
+            )
+            entry: dict[str, Any] = {
                 "username": username,
                 "password": password,
                 "updated_at": now_ms,
             }
+            if authenticated_url:
+                entry["authenticated_url"] = authenticated_url
+            credentials[picked_site] = entry
             _apply_credentials_to_records(records, picked_site, username, password)
             dirty = True
             print(f"Added credentials for {picked_site}.", flush=True)
@@ -671,11 +700,15 @@ def run_edit_logins_mode(websites_path: Path) -> None:
             password = password_input if password_input else current_password
 
             now_ms = int(time.time() * 1000)
-            credentials[picked_site] = {
+            authenticated_url = _normalize_authenticated_url(current.get("authenticated_url"))
+            entry: dict[str, Any] = {
                 "username": username,
                 "password": password,
                 "updated_at": now_ms,
             }
+            if authenticated_url:
+                entry["authenticated_url"] = authenticated_url
+            credentials[picked_site] = entry
             _apply_credentials_to_records(records, picked_site, username, password)
             dirty = True
             print(f"Updated credentials for {picked_site}.", flush=True)

@@ -13,6 +13,7 @@ from execution_common import ANSWER_MODEL, ManualLoginRequiredError, _responses_
 
 class LoginMixin:
     async def _ensure_login(self) -> None:
+        self.target_url = self._resolve_target_url(self.target_url)
         await _safe_goto(self.page, self.target_url)
         is_logged_in = await self._is_logged_in_page(self.page, self.target_url)
         if is_logged_in:
@@ -50,6 +51,13 @@ class LoginMixin:
             )
             await asyncio.get_event_loop().run_in_executor(None, input)
             await self.page.wait_for_timeout(300)
+            authenticated_url = self._capture_authenticated_url_from_context()
+            if authenticated_url:
+                try:
+                    self._persist_authenticated_url(authenticated_url)
+                except Exception:
+                    pass
+                self.target_url = authenticated_url
             if capture_enabled:
                 self._persist_login_form_memory()
             await self._persist_session_storage_from_context()
@@ -59,6 +67,7 @@ class LoginMixin:
             self.login_prompt_lock.release()
 
         await self._launch_context(headless=True)
+        self.target_url = self._resolve_target_url(self.target_url)
         await _safe_goto(self.page, self.target_url)
 
     async def _is_logged_in_page(self, page: Any, url: str) -> bool:
@@ -202,6 +211,25 @@ class LoginMixin:
             host = host[4:]
         return host
 
+    def _normalize_authenticated_url(self, value: Any) -> str:
+        if value is None:
+            return ""
+        text = value if isinstance(value, str) else str(value)
+        text = text.strip()
+        if not text:
+            return ""
+        parsed = urlparse(text)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return ""
+        return text
+
+    def _site_keys_match(self, site_key: str, candidate_key: str) -> bool:
+        left = self._normalize_site_key(site_key)
+        right = self._normalize_site_key(candidate_key)
+        if not left or not right:
+            return False
+        return left == right or left.endswith(f".{right}") or right.endswith(f".{left}")
+
     def _load_login_credentials_snapshot(self) -> dict[str, dict[str, Any]]:
         if not self.login_form_memory_path.exists():
             return {}
@@ -232,12 +260,154 @@ class LoginMixin:
             updated_at = item.get("updated_at")
             if not isinstance(updated_at, int):
                 updated_at = now_ms
-            out[site] = {
+            entry: dict[str, Any] = {
                 "username": username,
                 "password": password,
                 "updated_at": updated_at,
             }
+            authenticated_url = self._normalize_authenticated_url(item.get("authenticated_url"))
+            if authenticated_url:
+                entry["authenticated_url"] = authenticated_url
+            out[site] = entry
         return out
+
+    def _authenticated_url_for_target(self, target_url: str) -> str:
+        site_key = self._normalize_site_key(target_url)
+        if not site_key:
+            site_key = self._normalize_site_key(self.query.site)
+        if not site_key:
+            return ""
+
+        credentials = self._load_login_credentials_snapshot()
+        if not credentials:
+            return ""
+
+        direct = credentials.get(site_key)
+        if isinstance(direct, dict):
+            direct_url = self._normalize_authenticated_url(direct.get("authenticated_url"))
+            if direct_url:
+                return direct_url
+
+        for raw_site, item in credentials.items():
+            if not isinstance(item, dict):
+                continue
+            if not self._site_keys_match(site_key, str(raw_site)):
+                continue
+            candidate = self._normalize_authenticated_url(item.get("authenticated_url"))
+            if candidate:
+                return candidate
+        return ""
+
+    def _resolve_target_url(self, requested_url: str) -> str:
+        requested = (requested_url or "").strip()
+        if not requested:
+            return requested_url
+        authenticated_url = self._authenticated_url_for_target(requested)
+        if authenticated_url:
+            return authenticated_url
+        return requested
+
+    def _capture_authenticated_url_from_context(self) -> str:
+        if self._context is None:
+            return ""
+
+        candidates: list[str] = []
+        for page in self._context.pages:
+            normalized = self._normalize_authenticated_url((page.url or "").strip())
+            if normalized:
+                candidates.append(normalized)
+        if not candidates:
+            return ""
+
+        site_key = self._normalize_site_key(self.target_url) or self._normalize_site_key(self.query.site)
+        if site_key:
+            matching = [url for url in candidates if self._site_keys_match(site_key, url)]
+            if matching:
+                return matching[-1]
+        return candidates[-1]
+
+    def _persist_authenticated_url(self, authenticated_url: str) -> None:
+        normalized_url = self._normalize_authenticated_url(authenticated_url)
+        if not normalized_url:
+            return
+
+        site_key = self._normalize_site_key(self.query.site)
+        if not site_key:
+            site_key = self._normalize_site_key(self.target_url)
+        if not site_key:
+            site_key = self._normalize_site_key(normalized_url)
+        if not site_key:
+            return
+
+        payload: dict[str, Any] = {}
+        if self.login_form_memory_path.exists():
+            try:
+                parsed = json.loads(self.login_form_memory_path.read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    payload = dict(parsed)
+            except Exception:
+                payload = {}
+
+        raw_credentials = payload.get("credentials")
+        credentials: dict[str, dict[str, Any]] = {}
+        now_ms = int(time.time() * 1000)
+
+        if isinstance(raw_credentials, dict):
+            for raw_site_key, raw_item in raw_credentials.items():
+                normalized_site = self._normalize_site_key(str(raw_site_key))
+                if not normalized_site or not isinstance(raw_item, dict):
+                    continue
+                entry = dict(raw_item)
+                username = entry.get("username", "")
+                password = entry.get("password", "")
+                if username is None:
+                    username = ""
+                if password is None:
+                    password = ""
+                if not isinstance(username, str):
+                    username = str(username)
+                if not isinstance(password, str):
+                    password = str(password)
+                entry["username"] = username
+                entry["password"] = password
+                updated_at = entry.get("updated_at")
+                if not isinstance(updated_at, int):
+                    updated_at = now_ms
+                entry["updated_at"] = updated_at
+                existing_authenticated_url = self._normalize_authenticated_url(entry.get("authenticated_url"))
+                if existing_authenticated_url:
+                    entry["authenticated_url"] = existing_authenticated_url
+                else:
+                    entry.pop("authenticated_url", None)
+                credentials[normalized_site] = entry
+
+        existing = dict(credentials.get(site_key, {}))
+        username = existing.get("username", "")
+        password = existing.get("password", "")
+        if username is None:
+            username = ""
+        if password is None:
+            password = ""
+        if not isinstance(username, str):
+            username = str(username)
+        if not isinstance(password, str):
+            password = str(password)
+        existing["username"] = username
+        existing["password"] = password
+        existing["authenticated_url"] = normalized_url
+        existing["updated_at"] = now_ms
+        credentials[site_key] = existing
+
+        version = payload.get("version", 1)
+        try:
+            payload["version"] = int(version)
+        except Exception:
+            payload["version"] = 1
+        payload["saved_at"] = datetime.now(timezone.utc).isoformat()
+        payload["credentials"] = credentials
+
+        self.login_form_memory_path.parent.mkdir(parents=True, exist_ok=True)
+        self.login_form_memory_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def _save_login_form_memory_snapshot(self, records: list[dict[str, Any]]) -> None:
         self.login_form_memory_path.parent.mkdir(parents=True, exist_ok=True)
