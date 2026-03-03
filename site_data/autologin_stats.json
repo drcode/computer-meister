@@ -7,7 +7,14 @@
       "backoff_remaining": 0,
       "last_result": "autologin_success",
       "updated_at": "2026-02-27T20:19:40.077644+00:00"
+    },
+    "interactivebrokers.com": {
+      "attempts_since_successful_login": 5,
+      "consecutive_autologin_failures": 0,
+      "backoff_remaining": 0,
+      "last_result": "skipped_no_credentials",
+      "updated_at": "2026-03-03T01:59:45.955685+00:00"
     }
   },
-  "saved_at": "2026-02-27T20:19:40.077802+00:00"
+  "saved_at": "2026-03-03T01:59:45.955765+00:00"
 }

@@ -13,4 +13,8 @@ find the most recent price of AMZN
 - disabled
 find the stock holdings in the "Conrad" portfolio, also the cash balance (or margin balance) for the account.
 # fidelity.com 0
+- disabled
 find the stock holdings in the "Joint WROS" portfolio, also the cash balance (or margin balance).
+# interactivebrokers.com 0
+- nocapture
+determine the stock holdings in the account, with number of shares for each stock. Also determine the cash balance of the account (may be called by other names like "margin balance" or "margin debit", use your common sense)
