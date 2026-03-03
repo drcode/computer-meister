@@ -9,12 +9,19 @@
       "updated_at": "2026-02-27T20:19:40.077644+00:00"
     },
     "interactivebrokers.com": {
-      "attempts_since_successful_login": 9,
+      "attempts_since_successful_login": 10,
       "consecutive_autologin_failures": 0,
       "backoff_remaining": 0,
       "last_result": "skipped_no_credentials",
-      "updated_at": "2026-03-03T02:54:42.428545+00:00"
+      "updated_at": "2026-03-03T15:31:12.133482+00:00"
+    },
+    "usbancorp.com": {
+      "attempts_since_successful_login": 3,
+      "consecutive_autologin_failures": 0,
+      "backoff_remaining": 0,
+      "last_result": "skipped_no_credentials",
+      "updated_at": "2026-03-03T15:51:27.993058+00:00"
     }
   },
-  "saved_at": "2026-03-03T02:54:42.428652+00:00"
+  "saved_at": "2026-03-03T15:51:27.993134+00:00"
 }
