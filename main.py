@@ -14,7 +14,13 @@ from urllib.parse import urlparse
 from playwright.async_api import async_playwright
 
 from browse_story import run_browse_story_mode
-from execution_common import COOKIES_FILE, SESSION_STORAGE_FILE, _launch_context_kwargs
+from execution_common import (
+    COOKIES_FILE,
+    SESSION_STORAGE_FILE,
+    _STEALTH,
+    _android_emulation_context_kwargs,
+    _launch_context_kwargs,
+)
 from execution import (
     GLOBAL_LOGIN_INFO_FILE,
     LockRegistry,
@@ -238,6 +244,47 @@ async def _install_session_storage_init_script(context: Any, session_storage_pat
     await context.add_init_script(script=script)
 
 
+async def _install_human_login_stealth(context: Any) -> None:
+    script = """
+(() => {
+    try {
+        delete Object.getPrototypeOf(navigator).webdriver;
+        Object.defineProperty(navigator, "webdriver", {
+            get: () => undefined,
+            configurable: true
+        });
+    } catch (_) {}
+
+    try {
+        if (!window.chrome || !window.chrome.runtime) {
+            window.chrome = {
+                runtime: { id: undefined },
+                loadTimes: () => ({}),
+                csi: () => ({}),
+                app: { isInstalled: false }
+            };
+        }
+    } catch (_) {}
+
+    try {
+        if (navigator.permissions && navigator.permissions.query) {
+            const origQuery = navigator.permissions.query.bind(navigator.permissions);
+            navigator.permissions.query = (params) =>
+                (params && params.name === "notifications")
+                    ? Promise.resolve({ state: "prompt", onchange: null })
+                    : origQuery(params);
+        }
+    } catch (_) {}
+
+    try { delete window.__playwright; } catch (_) {}
+    try { delete window.__pw_manual; } catch (_) {}
+    try { delete window.__playwright__binding__; } catch (_) {}
+    try { delete window.__pwInitScripts; } catch (_) {}
+})();
+"""
+    await context.add_init_script(script=script)
+
+
 async def _persist_session_storage_from_context(context: Any, session_storage_path: Path) -> None:
     existing = _load_session_storage_snapshot(session_storage_path)
     updated: dict[str, dict[str, str]] = dict(existing)
@@ -305,15 +352,25 @@ async def _persist_cookies(context: Any, cookies_path: Path) -> None:
 
 async def _run_manual_session(*, query: WebsiteQuery, session_dir: Path) -> None:
     session_dir.mkdir(parents=True, exist_ok=True)
-    browser = CHROMIUM_BROWSER if query.browser == CHROMIUM_BROWSER else DEFAULT_BROWSER
-    launch_kwargs = _launch_context_kwargs(browser=browser, headless=False)
+    browser = query.effective_browser
     target_url = query.site if query.site.startswith(("http://", "https://")) else f"https://{query.site}"
     session_storage_path = session_dir / SESSION_STORAGE_FILE
     cookies_path = session_dir / COOKIES_FILE
+    android_device = ""
 
     playwright = await async_playwright().start()
     context = None
     try:
+        if query.android:
+            android_device, _android_kwargs = _android_emulation_context_kwargs(playwright.devices)
+
+        launch_kwargs = _launch_context_kwargs(
+            browser=query.browser,
+            headless=False,
+            android=query.android,
+            devices=playwright.devices,
+        )
+
         if browser == CHROMIUM_BROWSER:
             context = await playwright.chromium.launch_persistent_context(
                 str(session_dir),
@@ -325,6 +382,12 @@ async def _run_manual_session(*, query: WebsiteQuery, session_dir: Path) -> None
                 **launch_kwargs,
             )
 
+        if _STEALTH is not None:
+            try:
+                await _STEALTH.apply_stealth_async(context)
+            except Exception:
+                pass
+        await _install_human_login_stealth(context)
         await _install_session_storage_init_script(context, session_storage_path)
         await _restore_cookies(context, cookies_path)
         page = context.pages[0] if context.pages else await context.new_page()
@@ -334,7 +397,8 @@ async def _run_manual_session(*, query: WebsiteQuery, session_dir: Path) -> None
             print(f"Navigation warning for {target_url}: {exc}", flush=True)
 
         print(
-            f"Manual session for {query.section_id} using {browser}.",
+            f"Manual session for {query.section_id} using {browser}"
+            + (f" ({android_device} emulation)." if query.android else "."),
             flush=True,
         )
         print("Interact in the browser window. Press ENTER here to close the session.", flush=True)
@@ -749,7 +813,9 @@ def _format_query_flags(query: WebsiteQuery) -> str:
     flags: list[str] = []
     if query.disabled:
         flags.append("disabled")
-    if query.browser == CHROMIUM_BROWSER:
+    if query.android:
+        flags.append("android")
+    elif query.browser == CHROMIUM_BROWSER:
         flags.append("chromium")
     if query.nofill:
         flags.append("nofill")
@@ -795,7 +861,7 @@ def _edit_section(queries: list[WebsiteQuery], index: int) -> bool:
         )
         print(
             "Fields: [1]site [2]number [3]query [4]toggle-disabled "
-            "[5]browser [6]toggle-nofill [7]toggle-nocapture [8]done",
+            "[5]browser [6]toggle-android [7]toggle-nofill [8]toggle-nocapture [9]done",
             flush=True,
         )
         cmd = input("Field: ").strip()
@@ -846,23 +912,31 @@ def _edit_section(queries: list[WebsiteQuery], index: int) -> bool:
 
         if cmd == "5":
             if query.browser == DEFAULT_BROWSER:
-                query = replace(query, browser=CHROMIUM_BROWSER)
+                query = replace(query, browser=CHROMIUM_BROWSER, android=False)
             else:
                 query = replace(query, browser=DEFAULT_BROWSER)
             changed = True
             continue
 
         if cmd == "6":
-            query = replace(query, nofill=not query.nofill)
+            if query.android:
+                query = replace(query, android=False)
+            else:
+                query = replace(query, android=True, browser=DEFAULT_BROWSER)
             changed = True
             continue
 
         if cmd == "7":
-            query = replace(query, nocapture=not query.nocapture)
+            query = replace(query, nofill=not query.nofill)
             changed = True
             continue
 
         if cmd == "8":
+            query = replace(query, nocapture=not query.nocapture)
+            changed = True
+            continue
+
+        if cmd == "9":
             queries[index] = query
             return changed
 
@@ -917,7 +991,10 @@ def run_edit_websites_mode(websites_path: Path) -> None:
                 print("Query is required.", flush=True)
                 continue
 
-            use_chromium = _prompt_yes_no("Use chromium browser?", default=False)
+            android = _prompt_yes_no("Use android emulation? (implies chromium everywhere)", default=False)
+            use_chromium = False
+            if not android:
+                use_chromium = _prompt_yes_no("Use chromium browser?", default=False)
             disabled = _prompt_yes_no("Mark disabled?", default=False)
             nofill = _prompt_yes_no("Set nofill?", default=False)
             nocapture = _prompt_yes_no("Set nocapture?", default=False)
@@ -929,6 +1006,7 @@ def run_edit_websites_mode(websites_path: Path) -> None:
                     query=query_text,
                     disabled=disabled,
                     browser=CHROMIUM_BROWSER if use_chromium else DEFAULT_BROWSER,
+                    android=android,
                     nofill=nofill,
                     nocapture=nocapture,
                 )

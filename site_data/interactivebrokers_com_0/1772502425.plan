@@ -1,5 +1,0 @@
-target_site "https://interactivebrokers.com"
-login_required
-enable_text_entry
-explore_website_openai "Navigate to the portfolio or account summary page. Locate the table of stock holdings including the ticker symbols and number of shares. Also find the cash balance, which may be labeled as margin balance or margin debit." 40
-answer_query_text "List each stock holding with the number of shares. Also, report the cash balance or margin balance of the account."

@@ -24,6 +24,7 @@ from execution_common import (
     _plan_command_line,
     _plan_command_payload,
     _safe_goto,
+    _STEALTH,
 )
 from execution_content import AnsweringMixin, ArtifactRecorder
 from execution_exploration import ExplorationMixin, _execute_plan_interaction
@@ -121,8 +122,13 @@ class PlanExecutor(AutologinMixin, LoginMixin, ExplorationMixin, AnsweringMixin)
     async def _launch_context(self, *, headless: bool) -> None:
         if self._playwright is None:
             self._playwright = await async_playwright().start()
-        launch_kwargs = _launch_context_kwargs(browser=self.query.browser, headless=headless)
-        if self.query.browser == CHROMIUM_BROWSER:
+        launch_kwargs = _launch_context_kwargs(
+            browser=self.query.browser,
+            headless=headless,
+            android=self.query.android,
+            devices=self._playwright.devices,
+        )
+        if self.query.effective_browser == CHROMIUM_BROWSER:
             self._context = await self._playwright.chromium.launch_persistent_context(
                 str(self.session_dir),
                 **launch_kwargs,
@@ -132,11 +138,12 @@ class PlanExecutor(AutologinMixin, LoginMixin, ExplorationMixin, AnsweringMixin)
                 str(self.session_dir),
                 **launch_kwargs,
             )
-        human_login_injection_disabled = bool(self.query.nofill and not headless)
-        if not human_login_injection_disabled:
-            if not headless:
-                await self._install_human_login_stealth_init_script()
-            await self._install_session_storage_init_script()
+        if self._context is not None and _STEALTH is not None:
+            try:
+                await _STEALTH.apply_stealth_async(self._context)
+            except Exception:
+                pass
+        await self._install_session_storage_init_script()
         await self._restore_cookies()
         self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
 

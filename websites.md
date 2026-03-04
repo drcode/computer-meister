@@ -26,4 +26,5 @@ determine the stock holdings in the account, with number of shares for each stoc
 
 # usbancorp.com 0
 - nofill
+- android
 determine the stock holdings in the brokerage account ending in 0757, with number of shares for each stock. Also determine the cash balance of the account (may be called by other names like "margin balance" or "margin debit", use your common sense)

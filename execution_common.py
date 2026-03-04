@@ -9,6 +9,11 @@ from typing import Any
 
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 
+try:
+    from playwright_stealth import Stealth
+except Exception:  # pragma: no cover - optional dependency at runtime
+    Stealth = None  # type: ignore[assignment,misc]
+
 from planning import PlanCommand, render_plan
 from websites import CHROMIUM_BROWSER, DEFAULT_BROWSER, WebsiteQuery
 
@@ -26,10 +31,39 @@ ANSWER_MODEL = "gpt-5.2"
 SESSION_STORAGE_FILE = "session_storage.json"
 COOKIES_FILE = "cookies.json"
 GLOBAL_LOGIN_INFO_FILE = Path.home() / "computer_meister_login_info.json"
+ANDROID_DEVICE_CANDIDATES = ("Pixel 7", "Pixel 7 Pro", "Pixel 6", "Pixel 5", "Galaxy S9+")
 FIREFOX_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0.2"
 FIREFOX_STEALTH_PREFS = {
     "dom.webdriver.enabled": False,
+    "useAutomationExtension": False,
 }
+
+
+def _build_stealth() -> Any | None:
+    if Stealth is None:
+        return None
+    common_kwargs = {
+        "webgl_vendor": True,
+        "navigator_languages": True,
+        "navigator_plugins": True,
+        "navigator_permissions": True,
+        "navigator_hardware_concurrency": True,
+        "media_codecs": True,
+    }
+    try:
+        # Newer playwright-stealth releases use `webdriver`.
+        return Stealth(webdriver=True, **common_kwargs)
+    except TypeError:
+        try:
+            # Older releases use `navigator_webdriver`.
+            return Stealth(navigator_webdriver=True, **common_kwargs)
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+_STEALTH = _build_stealth()
 
 
 @dataclass(frozen=True)
@@ -125,20 +159,83 @@ def _dump_json(value: Any) -> str:
     return json.dumps(_sanitize_for_log(value), ensure_ascii=False, indent=2)
 
 
-def _launch_context_kwargs(*, browser: str, headless: bool) -> dict[str, Any]:
-    if browser == CHROMIUM_BROWSER:
+def _android_emulation_context_kwargs(devices: Any | None = None) -> tuple[str, dict[str, Any]]:
+    if isinstance(devices, dict):
+        for name in ANDROID_DEVICE_CANDIDATES:
+            descriptor = devices.get(name)
+            if not isinstance(descriptor, dict):
+                continue
+            payload: dict[str, Any] = {}
+            for key in ("viewport", "user_agent", "device_scale_factor", "is_mobile", "has_touch"):
+                if key in descriptor:
+                    payload[key] = descriptor[key]
+            if payload:
+                return name, payload
+    return (
+        "android-fallback",
+        {
+            "viewport": {"width": 412, "height": 839},
+            "user_agent": (
+                "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/143.0.7499.4 Mobile Safari/537.36"
+            ),
+            "device_scale_factor": 2.625,
+            "is_mobile": True,
+            "has_touch": True,
+        },
+    )
+
+
+def _launch_context_kwargs(
+    *,
+    browser: str,
+    headless: bool,
+    android: bool = False,
+    devices: Any | None = None,
+) -> dict[str, Any]:
+    effective_browser = CHROMIUM_BROWSER if android else browser
+    if effective_browser == CHROMIUM_BROWSER:
         args = list(CHROMIUM_ARGS)
         base = {
             "channel": CHROMIUM_BROWSER,
             "args": args,
         }
 
+        if android:
+            _android_name, android_kwargs = _android_emulation_context_kwargs(devices)
+            android_base = {**base, **android_kwargs}
+            if not headless:
+                return {
+                    **android_base,
+                    "headless": False,
+                    "ignore_default_args": ["--enable-automation"],
+                    "args": args
+                    + [
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                        "--disable-infobars",
+                        "--disable-component-update",
+                    ],
+                }
+            return {
+                **android_base,
+                "headless": True,
+            }
+
         if not headless:
             return {
                 **base,
                 "headless": False,
                 "no_viewport": True,
-                "args": args + [f"--window-size={DISPLAY_WIDTH},{DISPLAY_HEIGHT}"],
+                "ignore_default_args": ["--enable-automation"],
+                "args": args
+                + [
+                    f"--window-size={DISPLAY_WIDTH},{DISPLAY_HEIGHT}",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--disable-infobars",
+                    "--disable-component-update",
+                ],
             }
 
         return {
@@ -148,7 +245,7 @@ def _launch_context_kwargs(*, browser: str, headless: bool) -> dict[str, Any]:
             "device_scale_factor": 1,
         }
 
-    if browser != DEFAULT_BROWSER:
+    if effective_browser != DEFAULT_BROWSER:
         raise ValueError(f"Unsupported browser '{browser}'")
 
     args = list(FIREFOX_ARGS)

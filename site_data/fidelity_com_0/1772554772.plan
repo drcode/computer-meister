@@ -1,5 +1,0 @@
-target_site "https://fidelity.com"
-login_required
-enable_text_entry
-explore_website_openai "Navigate to the Portfolio page and select the 'Joint WROS' account. 1. Click the 'Positions' tab and scroll to capture all stock holdings. 2. Click the 'Balances' tab and ensure the 'Available to trade', 'Settled cash', or 'Margin balance' is visible in the snapshot." 40
-answer_query_text "List all stock holdings (symbol and quantity) and the cash balance (look for 'Settled cash', 'Available to trade', or 'Margin balance') for the Joint WROS portfolio. If the account is not found, list all visible account names."

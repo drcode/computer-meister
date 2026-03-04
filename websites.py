@@ -20,6 +20,7 @@ class WebsiteQuery:
     query: str
     disabled: bool = False
     browser: str = DEFAULT_BROWSER
+    android: bool = False
     nofill: bool = False
     nocapture: bool = False
 
@@ -34,9 +35,18 @@ class WebsiteQuery:
     @property
     def session_dir_name(self) -> str:
         site_name = sanitize_name(self.site)
+        if self.android:
+            return f"{site_name}_android_session"
         if self.browser == DEFAULT_BROWSER:
             return f"{site_name}_session"
         return f"{site_name}_{sanitize_name(self.browser)}_session"
+
+    @property
+    def effective_browser(self) -> str:
+        # Android emulation runs on Chromium even when no explicit -chromium flag is set.
+        if self.android:
+            return CHROMIUM_BROWSER
+        return self.browser
 
 
 def sanitize_name(value: str) -> str:
@@ -52,6 +62,15 @@ def _validate_unique_headers(queries: Iterable[WebsiteQuery]) -> None:
         if key in seen:
             raise ValueError(f"Duplicate section header: {item.site} {item.number}")
         seen.add(key)
+
+
+def _validate_query_flags(query: WebsiteQuery) -> None:
+    if query.browser not in SUPPORTED_BROWSERS:
+        raise ValueError(f"Unsupported browser '{query.browser}' in section '{query.section_id}'")
+    if query.android and query.browser == CHROMIUM_BROWSER:
+        raise ValueError(
+            f"Section '{query.section_id}' cannot include both -android and -chromium flags"
+        )
 
 
 def parse_websites_md(path: Path) -> list[WebsiteQuery]:
@@ -83,6 +102,7 @@ def parse_websites_md(path: Path) -> list[WebsiteQuery]:
                 "number": int(header_match.group(2)),
                 "disabled": False,
                 "browser": DEFAULT_BROWSER,
+                "android": False,
                 "nofill": False,
                 "nocapture": False,
                 "query": None,
@@ -98,6 +118,11 @@ def parse_websites_md(path: Path) -> list[WebsiteQuery]:
             continue
 
         if line == "- chromium":
+            if bool(current.get("android")):
+                raise ValueError(
+                    f"Line {i}: section '{current['site']} {current['number']}' "
+                    "cannot include both -android and -chromium flags"
+                )
             current["browser"] = CHROMIUM_BROWSER
             continue
 
@@ -107,6 +132,15 @@ def parse_websites_md(path: Path) -> list[WebsiteQuery]:
 
         if line == "- nocapture":
             current["nocapture"] = True
+            continue
+
+        if line == "- android":
+            if current.get("browser") == CHROMIUM_BROWSER:
+                raise ValueError(
+                    f"Line {i}: section '{current['site']} {current['number']}' "
+                    "cannot include both -android and -chromium flags"
+                )
+            current["android"] = True
             continue
 
         if current.get("query") is None:
@@ -126,6 +160,7 @@ def parse_websites_md(path: Path) -> list[WebsiteQuery]:
             query=str(s["query"]),
             disabled=bool(s["disabled"]),
             browser=str(s["browser"]),
+            android=bool(s["android"]),
             nofill=bool(s["nofill"]),
             nocapture=bool(s["nocapture"]),
         )
@@ -133,6 +168,8 @@ def parse_websites_md(path: Path) -> list[WebsiteQuery]:
     ]
 
     _validate_unique_headers(out)
+    for query in out:
+        _validate_query_flags(query)
     return out
 
 
@@ -146,13 +183,14 @@ def render_websites_md(queries: list[WebsiteQuery]) -> str:
             raise ValueError("site cannot be empty when writing websites.md")
         if not question:
             raise ValueError(f"Section '{query.section_id}' must have a non-empty query line")
-        if query.browser not in SUPPORTED_BROWSERS:
-            raise ValueError(f"Unsupported browser '{query.browser}' in section '{query.section_id}'")
+        _validate_query_flags(query)
 
         lines.append(f"# {site} {query.number}")
         if query.disabled:
             lines.append("- disabled")
-        if query.browser == CHROMIUM_BROWSER:
+        if query.android:
+            lines.append("- android")
+        elif query.browser == CHROMIUM_BROWSER:
             lines.append("- chromium")
         if query.nofill:
             lines.append("- nofill")

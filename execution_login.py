@@ -37,6 +37,7 @@ class LoginMixin:
             self.headless = False
             self.help_used = True
             await self._launch_context(headless=False)
+            await self._install_human_login_stealth()
             prefill_enabled = not self.query.nofill
             capture_enabled = prefill_enabled and not self.query.nocapture
             if prefill_enabled:
@@ -821,23 +822,44 @@ class LoginMixin:
 	"""
         await self._context.add_init_script(script=script)
 
-    async def _install_human_login_stealth_init_script(self) -> None:
+    async def _install_human_login_stealth(self) -> None:
         if self._context is None:
             return
         script = """
 (() => {
-  try {
-    Object.defineProperty(navigator, "webdriver", {
-      get: () => undefined,
-      configurable: true,
-    });
-  } catch (_) {}
-  try {
-    delete window.__playwright__binding__;
-  } catch (_) {}
-  try {
-    delete window.__pwInitScripts;
-  } catch (_) {}
+    try {
+        delete Object.getPrototypeOf(navigator).webdriver;
+        Object.defineProperty(navigator, "webdriver", {
+            get: () => undefined,
+            configurable: true
+        });
+    } catch (_) {}
+
+    try {
+        if (!window.chrome || !window.chrome.runtime) {
+            window.chrome = {
+                runtime: { id: undefined },
+                loadTimes: () => ({}),
+                csi: () => ({}),
+                app: { isInstalled: false }
+            };
+        }
+    } catch (_) {}
+
+    try {
+        if (navigator.permissions && navigator.permissions.query) {
+            const origQuery = navigator.permissions.query.bind(navigator.permissions);
+            navigator.permissions.query = (params) =>
+                (params && params.name === "notifications")
+                    ? Promise.resolve({ state: "prompt", onchange: null })
+                    : origQuery(params);
+        }
+    } catch (_) {}
+
+    try { delete window.__playwright; } catch (_) {}
+    try { delete window.__pw_manual; } catch (_) {}
+    try { delete window.__playwright__binding__; } catch (_) {}
+    try { delete window.__pwInitScripts; } catch (_) {}
 })();
 """
         await self._context.add_init_script(script=script)
