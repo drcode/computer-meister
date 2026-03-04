@@ -20,7 +20,9 @@ from execution_common import (
     _STEALTH,
     _android_emulation_context_kwargs,
     _launch_context_kwargs,
+    _safe_goto,
 )
+from execution_exploration import _execute_plan_interaction
 from execution import (
     GLOBAL_LOGIN_INFO_FILE,
     LockRegistry,
@@ -28,7 +30,7 @@ from execution import (
     run_query_execution,
     write_results_file,
 )
-from planning import create_plan_for_query
+from planning import create_plan_for_query, parse_plan_line
 from websites import (
     CHROMIUM_BROWSER,
     DEFAULT_BROWSER,
@@ -401,8 +403,75 @@ async def _run_manual_session(*, query: WebsiteQuery, session_dir: Path) -> None
             + (f" ({android_device} emulation)." if query.android else "."),
             flush=True,
         )
-        print("Interact in the browser window. Press ENTER here to close the session.", flush=True)
-        await asyncio.to_thread(input)
+        print(
+            "Enter plan commands in this terminal and they will run against the open browser page.",
+            flush=True,
+        )
+        print(
+            "Supported: target_site, enable_text_entry, click, type, keypress, wait, vscroll",
+            flush=True,
+        )
+        print("Type `help` for examples. Type `exit` to close the session.", flush=True)
+
+        allow_text_entry = False
+        while True:
+            try:
+                raw = await asyncio.to_thread(input, "manual> ")
+            except EOFError:
+                print("Input stream closed. Ending manual session.", flush=True)
+                break
+
+            line = raw.strip()
+            if not line or line.startswith("#") or line.startswith("//"):
+                continue
+
+            lowered = line.lower()
+            if lowered in {"exit", "quit", "q"}:
+                break
+            if lowered in {"help", "?"}:
+                print("Examples:", flush=True)
+                print('  target_site "https://example.com"', flush=True)
+                print("  click 300 420", flush=True)
+                print("  vscroll 700", flush=True)
+                print("  keypress Enter", flush=True)
+                print("  wait 1000", flush=True)
+                print("  enable_text_entry", flush=True)
+                print('  type "search text"', flush=True)
+                continue
+
+            try:
+                command = parse_plan_line(line)
+            except Exception as exc:  # noqa: BLE001
+                print(f"Invalid plan command: {exc}", flush=True)
+                continue
+
+            try:
+                if command.name == "enable_text_entry":
+                    allow_text_entry = True
+                    print("[manual] enable_text_entry", flush=True)
+                    continue
+
+                if command.name == "target_site":
+                    requested_url = str(command.args[0])
+                    await _safe_goto(page, requested_url)
+                    print(f"[manual] target_site {requested_url}", flush=True)
+                    continue
+
+                if command.name in {"click", "type", "keypress", "wait", "vscroll"}:
+                    await _execute_plan_interaction(page, command, allow_text_entry=allow_text_entry)
+                    print(f"[manual] {line}", flush=True)
+                    continue
+
+                print(
+                    (
+                        "Unsupported in manual mode: "
+                        f"{command.name}. Supported: target_site, enable_text_entry, "
+                        "click, type, keypress, wait, vscroll"
+                    ),
+                    flush=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"Command failed: {exc}", flush=True)
     finally:
         if context is not None:
             try:
