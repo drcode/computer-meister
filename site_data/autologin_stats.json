@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "sites": {
+    "usbancorp.com": {
+      "attempts_since_successful_login": 1,
+      "consecutive_autologin_failures": 0,
+      "backoff_remaining": 0,
+      "last_result": "skipped_no_credentials",
+      "updated_at": "2026-03-04T19:58:43.088396+00:00"
+    }
+  },
+  "saved_at": "2026-03-04T19:58:43.088499+00:00"
+}

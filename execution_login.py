@@ -30,13 +30,17 @@ class LoginMixin:
                 f"{self.query.section_id}; skipped in scrape-headless mode after autologin evaluation."
             )
 
+        manual_target_url = getattr(self, "requested_target_url", self.target_url)
+        if not isinstance(manual_target_url, str) or not manual_target_url.strip():
+            manual_target_url = self.target_url
+
         await self._close_context()
 
         self.login_prompt_lock.acquire()
         try:
             self.headless = False
             self.help_used = True
-            await self._launch_context(headless=False)
+            await self._launch_context(headless=False, restore_state=False)
             await self._install_human_login_stealth()
             prefill_enabled = not self.query.nofill
             capture_enabled = prefill_enabled and not self.query.nocapture
@@ -44,6 +48,7 @@ class LoginMixin:
                 await self._install_login_form_prefill_init_script()
             if capture_enabled:
                 await self._install_login_field_capture()
+            self.target_url = manual_target_url
             await _safe_goto(self.page, self.target_url)
             print(
                 f"\nLogin required for {self.query.section_id}. "
@@ -52,24 +57,10 @@ class LoginMixin:
             )
             await asyncio.get_event_loop().run_in_executor(None, input)
             await self.page.wait_for_timeout(300)
-            authenticated_url = self._capture_authenticated_url_from_context()
-            if authenticated_url:
-                try:
-                    self._persist_authenticated_url(authenticated_url)
-                except Exception:
-                    pass
-                self.target_url = authenticated_url
             if capture_enabled:
                 self._persist_login_form_memory()
-            await self._persist_session_storage_from_context()
-            await self._persist_cookies()
         finally:
-            await self._close_context()
             self.login_prompt_lock.release()
-
-        await self._launch_context(headless=True)
-        self.target_url = self._resolve_target_url(self.target_url)
-        await _safe_goto(self.page, self.target_url)
 
     async def _is_logged_in_page(self, page: Any, url: str) -> bool:
         # Give dynamic sites a short window to render before we classify login state.

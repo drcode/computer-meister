@@ -58,6 +58,7 @@ class PlanExecutor(AutologinMixin, LoginMixin, ExplorationMixin, AnsweringMixin)
         self.headless = True
         self.help_used = False
         self.target_url = f"https://{query.site}"
+        self.requested_target_url = self.target_url
         self._llm_call_counts: dict[str, int] = {}
 
         self.openai_client = OpenAI(api_key=load_openai_api_key())
@@ -119,7 +120,7 @@ class PlanExecutor(AutologinMixin, LoginMixin, ExplorationMixin, AnsweringMixin)
             raise RuntimeError("page is not initialized")
         return self._page
 
-    async def _launch_context(self, *, headless: bool) -> None:
+    async def _launch_context(self, *, headless: bool, restore_state: bool = True) -> None:
         if self._playwright is None:
             self._playwright = await async_playwright().start()
         launch_kwargs = _launch_context_kwargs(
@@ -143,8 +144,9 @@ class PlanExecutor(AutologinMixin, LoginMixin, ExplorationMixin, AnsweringMixin)
                 await _STEALTH.apply_stealth_async(self._context)
             except Exception:
                 pass
-        await self._install_session_storage_init_script()
-        await self._restore_cookies()
+        if restore_state:
+            await self._install_session_storage_init_script()
+            await self._restore_cookies()
         self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
 
     async def _close_context(self) -> None:
@@ -178,6 +180,7 @@ class PlanExecutor(AutologinMixin, LoginMixin, ExplorationMixin, AnsweringMixin)
 
         if name == "target_site":
             requested_url = str(command.args[0])
+            self.requested_target_url = requested_url
             self.target_url = self._resolve_target_url(requested_url)
             await _safe_goto(self.page, self.target_url)
             metadata: dict[str, Any] = {"url": self.target_url}
